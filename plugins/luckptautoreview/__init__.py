@@ -1806,4 +1806,4 @@ class LuckPTAutoReview(_PluginBase):
             return False
 
 
-plugin_class = FengchaoInvite
+plugin_class = LuckPTAutoReview
