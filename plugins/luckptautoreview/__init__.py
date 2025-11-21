@@ -22,7 +22,7 @@ import traceback
 from bs4 import BeautifulSoup # 确保导入
 
 
-class FengchaoInvite(_PluginBase):
+class LuckPTAutoReview(_PluginBase):
     # 插件名称
     plugin_name = "蜂巢邀请监控"
     # 插件描述
