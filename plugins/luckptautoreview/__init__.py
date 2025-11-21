@@ -28,15 +28,15 @@ class FengchaoInvite(_PluginBase):
     # 插件描述
     plugin_desc = "蜂巢论坛管理组定制专用"
     # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
+    plugin_icon = "https://pt.luckpt.de/logo1.png"
     # 插件版本
     plugin_version = "1.1.4"
     # 插件作者
-    plugin_author = "madrays"
+    plugin_author = "miss"
     # 作者主页
-    author_url = "https://github.com/madrays/MoviePilot-Plugins"
+    author_url = "https://pt.luckpt.de/"
     # 插件配置项ID前缀
-    plugin_config_prefix = "fengchaoinvite_"
+    plugin_config_prefix = "luckptautoreview_"
     # 加载顺序
     plugin_order = 31
     # 可使用的用户级别

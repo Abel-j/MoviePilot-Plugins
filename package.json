@@ -1,15 +1,15 @@
 {
   "FengchaoInvite": {
-    "name": "蜂巢论坛邀请监控",
-    "description": "蜂巢论坛管理组定制专用",
-    "labels": "邀请,蜂巢,论坛",
-    "version": "1.1.4",
-    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
-    "author": "madrays",
+    "name": "LuckPT站点验证自动审核插件",
+    "description": "LuckPT管理组定制专用",
+    "labels": "站点,LuckPT,自动审核",
+    "version": "1.1.5",
+    "icon": "https://pt.luckpt.de/logo1.png",
+    "author": "LuckPT",
     "level": 2,
     "v2": true,
     "history": {
-      "v1.1.4": "补充未定义变量"
+      "v1.1.5": "初始化插件"
     }
   }
 }
