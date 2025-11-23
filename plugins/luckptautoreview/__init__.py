@@ -126,6 +126,33 @@ DEFAULT_LEVEL_ALIASES: Dict[str, str] = {
     "航空母舰": "Nexus Master",
     "爹": "贵宾 (VIP)",
     "救命恩人": "贵宾 (VIP)",
+    "异教徒": "Peasant",
+    "路人": "User",
+    "御宅族": "Power User",
+    "宅修士": "Elite User",
+    "宅教士": "Crazy User",
+    "宅传教士": "Insane User",
+    "宅傳教士": "Insane User",
+    "宅護法": "Veteran User",
+    "宅护法": "Veteran User",
+    "宅賢者": "Extreme User",
+    "宅贤者": "Extreme User",
+    "宅聖": "Ultimate User",
+    "宅圣": "Ultimate User",
+    "宅神": "Nexus Master",
+    "福音組": "发布员 (Uploader)",
+    "福音组": "发布员 (Uploader)",
+    "现充": "贵宾 (VIP)",
+    "現充": "贵宾 (VIP)",
+    "fff团": "总版主 (Moderator)",
+    "fff團": "总版主 (Moderator)",
+    "执事": "管理员 (Administrator)",
+    "執事": "管理员 (Administrator)",
+    "司鐸": "管理员 (Administrator)",
+    "司铎": "管理员 (Administrator)",
+    "枢机": "维护开发员 (Sysop)",
+    "樞機": "维护开发员 (Sysop)",
+    "站宗": "主管 (Staff Leader)",
 }
 
 # 按优先级从高到低的关键词映射，用于模糊匹配等级。
@@ -136,62 +163,78 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("大将军", "Nexus Master"),
     ("上将", "Nexus Master"),
     ("航空母舰", "Nexus Master"),
+    ("宅神", "Nexus Master"),
     ("神仙", "Ultimate User"),
     ("ultimate user", "Ultimate User"),
     ("幻梦", "Ultimate User"),
     ("副都统", "Ultimate User"),
     ("中将", "Ultimate User"),
     ("战列舰", "Ultimate User"),
+    ("宅圣", "Ultimate User"),
+    ("宅聖", "Ultimate User"),
     ("大师", "Extreme User"),
     ("extreme user", "Extreme User"),
     ("归尘", "Extreme User"),
     ("正参领", "Extreme User"),
     ("少将", "Extreme User"),
     ("巡洋舰", "Extreme User"),
+    ("宅贤者", "Extreme User"),
+    ("宅賢者", "Extreme User"),
     ("veteran", "Veteran User"),
     ("veteran user", "Veteran User"),
     ("翩跹", "Veteran User"),
     ("副参领", "Veteran User"),
     ("上校", "Veteran User"),
     ("驱逐舰", "Veteran User"),
+    ("宅护法", "Veteran User"),
+    ("宅護法", "Veteran User"),
     ("insane", "Insane User"),
     ("insane user", "Insane User"),
     ("恋风", "Insane User"),
     ("正军校", "Insane User"),
     ("中校", "Insane User"),
     ("邮轮", "Insane User"),
+    ("宅传教士", "Insane User"),
+    ("宅傳教士", "Insane User"),
     ("crazy", "Crazy User"),
     ("crazy user", "Crazy User"),
     ("破茧", "Crazy User"),
     ("副军校", "Crazy User"),
     ("少校", "Crazy User"),
     ("赛艇", "Crazy User"),
+    ("宅教士", "Crazy User"),
     ("精英", "Elite User"),
     ("elite user", "Elite User"),
     ("军士", "Elite User"),
     ("化蛹", "Elite User"),
     ("尉官", "Elite User"),
     ("竹筏", "Elite User"),
+    ("宅修士", "Elite User"),
     ("年轻气盛", "Power User"),
     ("易形", "Power User"),
     ("power", "Power User"),
     ("power user", "Power User"),
     ("士官", "Power User"),
     ("独木舟", "Power User"),
+    ("御宅族", "Power User"),
     ("新人", "User"),
     ("萌动", "User"),
     ("平民", "User"),
     ("列兵", "User"),
     ("澡盆", "User"),
+    ("路人", "User"),
     ("吸血鬼", "Peasant"),
     ("惊蛰", "Peasant"),
     ("叛徒", "Peasant"),
     ("庶民", "Peasant"),
     ("救生圈", "Peasant"),
     ("贫民", "Peasant"),
+    ("异教徒", "Peasant"),
     ("uploader", "发布员 (Uploader)"),
     ("downloader", "发布员 (Uploader)"),
     ("保种员", "发布员 (Uploader)"),
+    ("福音组", "发布员 (Uploader)"),
+    ("福音組", "发布员 (Uploader)"),
     ("moderator", "总版主 (Moderator)"),
     ("管理员", "管理员 (Administrator)"),
     ("站长", "管理员 (Administrator)"),
@@ -206,6 +249,8 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("荣誉会员", "贵宾 (VIP)"),
     ("荣誉", "贵宾 (VIP)"),
     ("honor", "贵宾 (VIP)"),
+    ("现充", "贵宾 (VIP)"),
+    ("現充", "贵宾 (VIP)"),
     ("发布员", "发布员 (Uploader)"),
     ("编辑员", "总版主 (Moderator)"),
     ("助理员", "总版主 (Moderator)"),
@@ -213,6 +258,15 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("管理员", "管理员 (Administrator)"),
     ("维护开发员", "维护开发员 (Sysop)"),
     ("主管", "主管 (Staff Leader)"),
+    ("fff团", "总版主 (Moderator)"),
+    ("fff團", "总版主 (Moderator)"),
+    ("执事", "管理员 (Administrator)"),
+    ("執事", "管理员 (Administrator)"),
+    ("司铎", "管理员 (Administrator)"),
+    ("司鐸", "管理员 (Administrator)"),
+    ("枢机", "维护开发员 (Sysop)"),
+    ("樞機", "维护开发员 (Sysop)"),
+    ("站宗", "主管 (Staff Leader)"),
     ("peasant", "Peasant"),
     ("user", "User"),
 ]
@@ -634,10 +688,38 @@ class ParserEngine:
             if parent:
                 siblings = [c for c in parent.find_all(["td", "th"]) if c is not cell]
                 for sib in siblings:
-                    candidate = self._clean_text(sib.get_text(" ", strip=True))
-                    if candidate:
-                        return candidate
+                        candidate = self._clean_text(sib.get_text(" ", strip=True))
+                        if candidate:
+                            return candidate
         return None
+
+    def _extract_label_map(self, soup: BeautifulSoup) -> Dict[str, str]:
+        """
+        兜底提取类似“标签 + 值”两列表格的映射，便于当常规解析缺失时快速补齐。
+        仅用作缺失字段的后备来源，不覆盖已解析出的值。
+        """
+        mapping: Dict[str, str] = {}
+        if not soup:
+            return mapping
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            label_raw = self._clean_text(cells[0].get_text(" ", strip=True))
+            if not label_raw:
+                continue
+            value_cell = cells[1]
+            value = None
+            img = value_cell.find("img", title=True) or value_cell.find("img", alt=True)
+            if img and (img.get("title") or img.get("alt")):
+                value = self._clean_text(img.get("title") or img.get("alt"))
+            if not value:
+                val_text = self._clean_text(value_cell.get_text(" ", strip=True))
+                if val_text:
+                    value = val_text
+            if value:
+                mapping[label_raw.lower()] = value
+        return mapping
 
     def normalize_level(self, raw: str, overrides: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[int]]:
         if not raw:
@@ -728,6 +810,7 @@ class ParserEngine:
         level_raw = None
         profile_url = None
         register_time = None
+        label_map: Dict[str, str] = {}
         site_key_l = (site_key or "").lower()
         base_url_l = (base_url or "").lower()
         is_open_cd = site_key_l in ("opencd", "open.cd", "open_cd") or "open.cd" in base_url_l
@@ -858,6 +941,14 @@ class ParserEngine:
                     match = re.search(r"[\\w.+'%-]+@[\\w.-]+", text_all)
                 if match:
                     email = match.group(0).strip()
+            if not email:
+                if not label_map:
+                    label_map = self._extract_label_map(soup)
+                for key in ("邮箱", "email", "e-mail", "mail"):
+                    val = label_map.get(key.lower())
+                    if val and "@" in val:
+                        email = val
+                        break
         # OpenCD 页脚的联系邮箱，若无个人邮箱则应忽略
         if is_open_cd and email and email.lower() == "opencd.service@gmail.com":
             email = None
@@ -886,6 +977,14 @@ class ParserEngine:
             level_by_label = self._find_value_by_labels(soup, ["等级", "class", "用户组", "等級", "级别"])
             if level_by_label:
                 level_raw = self._clean_text(level_by_label)
+        if not level_raw:
+            if not label_map:
+                label_map = self._extract_label_map(soup)
+            for key in ("等级", "class", "用户组", "等級", "级别"):
+                val = label_map.get(key.lower())
+                if val:
+                    level_raw = val
+                    break
         # 兜底：扫描页面内所有等级图标
         if not level_raw:
             src_level_map = {
@@ -945,6 +1044,15 @@ class ParserEngine:
             )
             if register_time:
                 register_time = self._clean_text(register_time.split("(")[0])
+        if not register_time:
+            if not label_map:
+                label_map = self._extract_label_map(soup)
+            for key in ("注册时间", "加入日期", "入站时间", "join date", "registration date", "加入时间"):
+                val = label_map.get(key.lower())
+                if val:
+                    register_time = self._clean_text(val.split("(")[0])
+                    if register_time:
+                        break
         if not register_time:
             m = re.search(
                 r"(注册时间|加入日期|Join Date)[：: ]+([^<\\n]+)",
