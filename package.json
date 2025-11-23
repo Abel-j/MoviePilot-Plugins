@@ -1,15 +1,12 @@
 {
   "LuckPTAutoReview": {
-    "name": "LuckPT站点验证自动审核插件",
+    "name": "LuckPT自动审核",
     "description": "LuckPT管理组定制专用",
     "labels": "站点,LuckPT,自动审核",
-    "version": "1.1.5",
-    "icon": "https://pt.luckpt.de/logo1.png",
+    "version": "3.0.0",
+    "icon": "https://github.com/Abel-j/MoviePilot-Plugins/blob/main/icons/LuckPT.png",
     "author": "LuckPT",
     "level": 2,
-    "v2": true,
-    "history": {
-      "v1.1.5": "初始化插件"
-    }
+    "v2": true
   }
 }

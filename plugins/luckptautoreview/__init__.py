@@ -1,1809 +1,2681 @@
-import random
 import json
 import time
-import re
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from typing import Any, List, Dict, Tuple, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urljoin, parse_qs
 
-import pytz # 确保导入 pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from bs4 import BeautifulSoup
+
 from app.core.config import settings
-from app.core.event import eventmanager
-from app.helper.cookie import CookieHelper
+from app.helper.sites import SitesHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.utils.http import RequestUtils
-from app.utils.string import StringUtils
 from app.schemas import NotificationType
-from app.helper.sites import SitesHelper
-from urllib.parse import urlparse
-import traceback
-from bs4 import BeautifulSoup # 确保导入
+from app.utils.http import RequestUtils
 
 
+# ----------------------------
+# 常量 / 默认配置
+# ----------------------------
+LEVEL_ORDER = [
+    "Peasant",
+    "User",
+    "Power User",
+    "Elite User",
+    "Crazy User",
+    "Insane User",
+    "Veteran User",
+    "Extreme User",
+    "Ultimate User",
+    "Nexus Master",
+    "贵宾 (VIP)",
+    "养老族 (Retiree)",
+    "发布员 (Uploader)",
+    "总版主 (Moderator)",
+    "管理员 (Administrator)",
+    "维护开发员 (Sysop)",
+    "主管 (Staff Leader)",
+]
+
+DEFAULT_LEVEL_ALIASES: Dict[str, str] = {
+    "poweruser": "Power User",
+    "pu": "Power User",
+    "eliteuser": "Elite User",
+    "crazyuser": "Crazy User",
+    "insaneuser": "Insane User",
+    "veteranuser": "Veteran User",
+    "extremeuser": "Extreme User",
+    "ultimateuser": "Ultimate User",
+    "nexusmaster": "Nexus Master",
+    "vip": "贵宾 (VIP)",
+    "v i p": "贵宾 (VIP)",
+    "貴賓": "贵宾 (VIP)",
+    "总版主": "总版主 (Moderator)",
+    "總版主": "总版主 (Moderator)",
+    "管理员": "管理员 (Administrator)",
+    "管理員": "管理员 (Administrator)",
+    "系统管理员": "维护开发员 (Sysop)",
+    "系統管理員": "维护开发员 (Sysop)",
+    "版主": "总版主 (Moderator)",
+    "版務": "总版主 (Moderator)",
+    "发布员": "发布员 (Uploader)",
+    "發布員": "发布员 (Uploader)",
+    "养老族": "养老族 (Retiree)",
+    "養老族": "养老族 (Retiree)",
+    "吸血鬼": "Peasant",
+    "惊蛰": "Peasant",
+    "新人": "User",
+    "萌动": "User",
+    "易形": "Power User",
+    "精英": "Elite User",
+    "化蛹": "Elite User",
+    "破茧": "Crazy User",
+    "恋风": "Insane User",
+    "翩跹": "Veteran User",
+    "归尘": "Extreme User",
+    "幻梦": "Ultimate User",
+    "逍遥": "Nexus Master",
+    "叛徒": "Peasant",
+    "平民": "User",
+    "正兵": "Power User",
+    "军士": "Elite User",
+    "副军校": "Crazy User",
+    "正军校": "Insane User",
+    "副参领": "Veteran User",
+    "正参领": "Extreme User",
+    "副都统": "Ultimate User",
+    "大将军": "Nexus Master",
+    "大师": "Extreme User",
+    "神仙": "Ultimate User",
+    "神王": "Nexus Master",
+    "贵宾": "贵宾 (VIP)",
+    "荣誉会员": "贵宾 (VIP)",
+    "荣誉": "贵宾 (VIP)",
+    "honor": "贵宾 (VIP)",
+    "发布员": "发布员 (Uploader)",
+    "保种员": "发布员 (Uploader)",
+    "编辑员": "总版主 (Moderator)",
+    "助理员": "总版主 (Moderator)",
+    "维护开发员": "维护开发员 (Sysop)",
+    "主管": "主管 (Staff Leader)",
+    "站长": "管理员 (Administrator)",
+    "庶民": "Peasant",
+    "列兵": "User",
+    "士官": "Power User",
+    "尉官": "Elite User",
+    "少校": "Crazy User",
+    "中校": "Insane User",
+    "上校": "Veteran User",
+    "少将": "Extreme User",
+    "中将": "Ultimate User",
+    "上将": "Nexus Master",
+    "救生圈": "Peasant",
+    "澡盆": "User",
+    "独木舟": "Power User",
+    "竹筏": "Elite User",
+    "赛艇": "Crazy User",
+    "邮轮": "Insane User",
+    "驱逐舰": "Veteran User",
+    "巡洋舰": "Extreme User",
+    "战列舰": "Ultimate User",
+    "航空母舰": "Nexus Master",
+    "爹": "贵宾 (VIP)",
+    "救命恩人": "贵宾 (VIP)",
+}
+
+# 按优先级从高到低的关键词映射，用于模糊匹配等级。
+LEVEL_KEYWORDS: List[Tuple[str, str]] = [
+    ("神王", "Nexus Master"),
+    ("nexus master", "Nexus Master"),
+    ("逍遥", "Nexus Master"),
+    ("大将军", "Nexus Master"),
+    ("上将", "Nexus Master"),
+    ("航空母舰", "Nexus Master"),
+    ("神仙", "Ultimate User"),
+    ("ultimate user", "Ultimate User"),
+    ("幻梦", "Ultimate User"),
+    ("副都统", "Ultimate User"),
+    ("中将", "Ultimate User"),
+    ("战列舰", "Ultimate User"),
+    ("大师", "Extreme User"),
+    ("extreme user", "Extreme User"),
+    ("归尘", "Extreme User"),
+    ("正参领", "Extreme User"),
+    ("少将", "Extreme User"),
+    ("巡洋舰", "Extreme User"),
+    ("veteran", "Veteran User"),
+    ("veteran user", "Veteran User"),
+    ("翩跹", "Veteran User"),
+    ("副参领", "Veteran User"),
+    ("上校", "Veteran User"),
+    ("驱逐舰", "Veteran User"),
+    ("insane", "Insane User"),
+    ("insane user", "Insane User"),
+    ("恋风", "Insane User"),
+    ("正军校", "Insane User"),
+    ("中校", "Insane User"),
+    ("邮轮", "Insane User"),
+    ("crazy", "Crazy User"),
+    ("crazy user", "Crazy User"),
+    ("破茧", "Crazy User"),
+    ("副军校", "Crazy User"),
+    ("少校", "Crazy User"),
+    ("赛艇", "Crazy User"),
+    ("精英", "Elite User"),
+    ("elite user", "Elite User"),
+    ("军士", "Elite User"),
+    ("化蛹", "Elite User"),
+    ("尉官", "Elite User"),
+    ("竹筏", "Elite User"),
+    ("年轻气盛", "Power User"),
+    ("易形", "Power User"),
+    ("power", "Power User"),
+    ("power user", "Power User"),
+    ("士官", "Power User"),
+    ("独木舟", "Power User"),
+    ("新人", "User"),
+    ("萌动", "User"),
+    ("平民", "User"),
+    ("列兵", "User"),
+    ("澡盆", "User"),
+    ("吸血鬼", "Peasant"),
+    ("惊蛰", "Peasant"),
+    ("叛徒", "Peasant"),
+    ("庶民", "Peasant"),
+    ("救生圈", "Peasant"),
+    ("贫民", "Peasant"),
+    ("uploader", "发布员 (Uploader)"),
+    ("downloader", "发布员 (Uploader)"),
+    ("保种员", "发布员 (Uploader)"),
+    ("moderator", "总版主 (Moderator)"),
+    ("管理员", "管理员 (Administrator)"),
+    ("站长", "管理员 (Administrator)"),
+    ("administrator", "管理员 (Administrator)"),
+    ("sysop", "维护开发员 (Sysop)"),
+    ("staff leader", "主管 (Staff Leader)"),
+    ("retiree", "养老族 (Retiree)"),
+    ("养老族", "养老族 (Retiree)"),
+    ("vip", "贵宾 (VIP)"),
+    ("贵宾", "贵宾 (VIP)"),
+    ("貴賓", "贵宾 (VIP)"),
+    ("荣誉会员", "贵宾 (VIP)"),
+    ("荣誉", "贵宾 (VIP)"),
+    ("honor", "贵宾 (VIP)"),
+    ("发布员", "发布员 (Uploader)"),
+    ("编辑员", "总版主 (Moderator)"),
+    ("助理员", "总版主 (Moderator)"),
+    ("总版主", "总版主 (Moderator)"),
+    ("管理员", "管理员 (Administrator)"),
+    ("维护开发员", "维护开发员 (Sysop)"),
+    ("主管", "主管 (Staff Leader)"),
+    ("peasant", "Peasant"),
+    ("user", "User"),
+]
+
+HIGH_PRIVACY_KEYWORDS = [
+    "访问被用户",
+    "保护其隐私",
+    "拒绝访问",
+    "private profile",
+    "you do not have permission",
+]
+
+
+# ----------------------------
+# 配置管理
+# ----------------------------
+class ConfigManager:
+    """封装插件配置与远端配置缓存。"""
+
+    DEFAULT_CONFIG: Dict[str, Any] = {
+        "enabled": False,
+        "api_token": "",
+        "review_cron": "*/5 * * * *",
+        "config_sync_interval_minutes": 10,
+        "log_refresh_interval_minutes": 10,
+        "run_cookie_check_once": False,
+        "run_parse_check_once": False,
+        "cookie_check_interval_minutes": 60,
+        "notify_review_result": True,
+        "notify_exception": True,
+        "notify_pending": True,
+        "notify_cookie_invalid": True,
+        "status_retry_count": 3,
+        "status_retry_interval_seconds": 30,
+        "api_base_url": "https://pt.luckpt.de",
+        "api_proxy": "",
+        "test_parse_url": "",
+    }
+
+    def __init__(self, plugin: "_PluginBase", config: Optional[dict]):
+        self.plugin = plugin
+        merged = dict(self.DEFAULT_CONFIG)
+        merged.update(config or {})
+        self.config = merged
+
+        self.remote_config_cache: Dict[str, Any] = plugin.get_data("remote_config_cache") or {}
+        self.remote_config_ts: Optional[str] = plugin.get_data("remote_config_synced_at")
+        self.last_log_fetch: Optional[str] = plugin.get_data("last_log_fetch")
+
+    # --- 基础字段 ---
+    @property
+    def enabled(self) -> bool:
+        return bool(self.config.get("enabled"))
+
+    @property
+    def api_token(self) -> str:
+        return self.config.get("api_token") or ""
+
+    @property
+    def api_base(self) -> str:
+        default_base = getattr(settings, "LUCKPT_REVIEW_API", self.DEFAULT_CONFIG["api_base_url"])
+        base = self.config.get("api_base_url") or default_base
+        return base.rstrip("/")
+
+    @property
+    def api_proxy(self) -> Optional[str]:
+        proxy = str(self.config.get("api_proxy") or "").strip()
+        return proxy or None
+
+    @property
+    def api_proxies(self) -> Optional[Dict[str, str]]:
+        proxy = self.api_proxy
+        if not proxy:
+            return None
+        return {"http": proxy, "https": proxy}
+
+    @property
+    def review_cron(self) -> str:
+        return self.config.get("review_cron") or "*/5 * * * *"
+
+    @property
+    def config_sync_interval(self) -> int:
+        return int(self.config.get("config_sync_interval_minutes") or 10)
+
+    @property
+    def cookie_check_interval(self) -> int:
+        return int(self.config.get("cookie_check_interval_minutes") or 60)
+
+    @property
+    def log_refresh_interval(self) -> int:
+        return int(self.config.get("log_refresh_interval_minutes") or 10)
+
+    @property
+    def status_retry_count(self) -> int:
+        return int(self.config.get("status_retry_count") or 3)
+
+    @property
+    def status_retry_interval(self) -> int:
+        return int(self.config.get("status_retry_interval_seconds") or 30)
+
+    @property
+    def auto_review_enabled_remote(self) -> bool:
+        # 当远端关闭自动审核时，本地仅保留检测任务
+        return str(self.remote_config_cache.get("auto_review_enabled", "true")).lower() == "true"
+
+    @property
+    def min_user_class(self) -> str:
+        return self.remote_config_cache.get("min_user_class") or "User"
+
+    @property
+    def verification_level(self) -> str:
+        level = str((self.remote_config_cache or {}).get("verification_level") or "high").lower()
+        return "low" if level == "low" else "high"
+
+    def parse_rule(self, site_key: str) -> Dict[str, Any]:
+        rules = (self.remote_config_cache or {}).get("parse_overrides") or {}
+        return rules.get(site_key) or {}
+
+    def level_aliases(self, site_key: str) -> Dict[str, str]:
+        aliases = (self.remote_config_cache or {}).get("level_aliases") or {}
+        site_rules = self.parse_rule(site_key) or {}
+        site_level_alias = site_rules.get("level_aliases") or {}
+        merged = dict(aliases)
+        merged.update(site_level_alias)
+        return merged
+
+    @property
+    def remote_sites(self) -> List[Dict[str, Any]]:
+        return self.remote_config_cache.get("sites") or []
+
+    def update_config(self, new_config: Dict[str, Any]):
+        self.config.update(new_config)
+        self.plugin.update_config(self.config)
+
+    def clear_oneoff_flag(self, key: str):
+        if key not in ("run_cookie_check_once", "run_parse_check_once"):
+            return
+        if self.config.get(key):
+            self.config[key] = False
+            self.plugin.update_config(self.config)
+
+    def should_run_test_parse(self) -> Optional[str]:
+        url = (self.config or {}).get("test_parse_url")
+        if url and isinstance(url, str) and url.strip():
+            return url.strip()
+        return None
+
+    def update_remote_cache(self, data: Dict[str, Any]):
+        self.remote_config_cache = data or {}
+        ts = datetime.now().isoformat()
+        self.remote_config_ts = ts
+        self.plugin.save_data("remote_config_cache", self.remote_config_cache)
+        self.plugin.save_data("remote_config_synced_at", ts)
+        logger.info(
+            "审核系统配置已同步：min_user_class=%s, sites=%s, auto_review_enabled=%s",
+            self.min_user_class,
+            len(self.remote_sites),
+            self.auto_review_enabled_remote,
+        )
+
+    def should_sync_remote(self) -> bool:
+        if not self.remote_config_ts:
+            return True
+        try:
+            last = datetime.fromisoformat(self.remote_config_ts)
+            return datetime.now(last.tzinfo) - last >= timedelta(minutes=self.config_sync_interval)
+        except Exception:
+            return True
+
+    def record_log_fetch(self):
+        ts = datetime.now().isoformat()
+        self.last_log_fetch = ts
+        self.plugin.save_data("last_log_fetch", ts)
+
+    def should_fetch_logs(self) -> bool:
+        if not self.last_log_fetch:
+            return True
+        try:
+            last = datetime.fromisoformat(self.last_log_fetch)
+            return datetime.now(last.tzinfo) - last >= timedelta(minutes=self.log_refresh_interval)
+        except Exception:
+            return True
+
+
+# ----------------------------
+# 站点与 Cookie 管理
+# ----------------------------
+class SiteRegistry:
+    """聚合远端站点与本地站点，并负责 Cookie 状态缓存。"""
+
+    def __init__(self, plugin: "_PluginBase", config: ConfigManager, sites_helper: SitesHelper):
+        self.plugin = plugin
+        self.config_mgr = config
+        self.sites_helper = sites_helper
+        self.cookie_status: Dict[str, Dict[str, Any]] = plugin.get_data("cookie_status") or {}
+        self.site_mapping: Dict[str, Dict[str, Any]] = {}
+
+    def refresh(self):
+        local_sites = self.sites_helper.get_indexers() or []
+        remote_sites = self.config_mgr.remote_sites
+
+        mapping: Dict[str, Dict[str, Any]] = {}
+        local_by_key = {}
+        for site in local_sites:
+            key = (site.get("pri_name") or site.get("name") or "").lower()
+            domain = urlparse(site.get("url") or "").netloc
+            local_by_key[key] = site
+            if domain:
+                local_by_key[domain] = site
+        for remote in remote_sites:
+            key = remote.get("key") or remote.get("site_key") or ""
+            domain = urlparse(remote.get("url") or "").netloc
+            local_match = local_by_key.get(key.lower()) or local_by_key.get(domain.lower())
+            mapping[key] = {
+                "remote": remote,
+                "local": local_match,
+                "domain": domain,
+                "has_cookie": bool(local_match and local_match.get("cookie")),
+            }
+        self.site_mapping = mapping
+
+    def match_site_account(self, site_account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        site_key = site_account.get("site_key") or site_account.get("key")
+        url_host = urlparse(site_account.get("url") or "").netloc
+        if not self.site_mapping:
+            self.refresh()
+        match = self.site_mapping.get(site_key) or self.site_mapping.get(url_host)
+        if match:
+            return match
+        # 容错：尝试主域名匹配
+        for key, value in self.site_mapping.items():
+            if value.get("domain") == url_host:
+                return value
+        return None
+
+    def update_cookie_status(self, site_key: str, status: Dict[str, Any]):
+        self.cookie_status[site_key] = status
+        self.plugin.save_data("cookie_status", self.cookie_status)
+
+    def check_cookie_validity(self, site_key: str, site: Dict[str, Any]) -> Dict[str, Any]:
+        result = {
+            "site_key": site_key,
+            "site_name": (site.get("remote") or {}).get("name") or site_key,
+            "valid": False,
+            "matched": bool(site.get("local")),
+            "reason": "",
+            "checked_at": datetime.now().isoformat(),
+        }
+        if not site.get("local"):
+            result["reason"] = "本地未配置站点"
+            return result
+        cookie = site["local"].get("cookie")
+        ua = site["local"].get("ua") or settings.USER_AGENT
+        base_url = (site.get("remote") or {}).get("url") or site["local"].get("url")
+        if not cookie or not base_url:
+            result["reason"] = "缺少站点 URL 或 Cookie"
+            return result
+
+        try:
+            req = RequestUtils(headers={"Cookie": cookie, "User-Agent": ua}, timeout=30)
+            res = req.get_res(base_url, allow_redirects=True)
+            if not res:
+                result["reason"] = "无响应"
+                return result
+            if res.status_code in (301, 302) and "login" in (res.headers.get("Location") or "").lower():
+                result["reason"] = "跳转登录页"
+                return result
+            text = res.text or ""
+            if "logout" in text.lower() or (site["local"].get("username") or "").lower() in text.lower():
+                result["valid"] = True
+                result["reason"] = ""
+            elif "login" in text.lower():
+                result["reason"] = "页面包含登录提示"
+            else:
+                result["valid"] = True
+        except Exception as exc:
+            result["reason"] = f"检测异常: {exc}"
+            logger.error("检测站点 %s Cookie 失败: %s", site_key, exc)
+        return result
+
+    def _check_cookie_with_retry(self, site_key: str, site: Dict[str, Any], attempts: int = 5, delay: float = 1.0):
+        status = None
+        for idx in range(attempts):
+            status = self.check_cookie_validity(site_key, site)
+            reason = status.get("reason") or ""
+            if status.get("valid"):
+                break
+            if not reason or not any(keyword in reason for keyword in ("无响应", "异常", "超时", "访问失败")):
+                break
+            if idx < attempts - 1:
+                time.sleep(delay)
+        return status
+
+    def run_cookie_check(self) -> List[Dict[str, Any]]:
+        self.refresh()
+        reports: List[Dict[str, Any]] = []
+        logger.info("开始 Cookie 有效性检测，站点数=%s", len(self.site_mapping))
+        futures = {}
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for key, site in self.site_mapping.items():
+                futures[executor.submit(self._check_cookie_with_retry, key, site)] = key
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    logger.error("Cookie检测并发任务异常：站点=%s 错误=%s", key, exc)
+                    status = {
+                        "site_key": key,
+                        "site_name": key,
+                        "valid": False,
+                        "matched": False,
+                        "reason": f"并发检测异常: {exc}",
+                        "checked_at": datetime.now().isoformat(),
+                    }
+                prev = self.cookie_status.get(key)
+                self.update_cookie_status(key, status)
+                reports.append(status)
+                logger.debug(
+                    "Cookie检测 站点=%s 匹配=%s 有效=%s 原因=%s",
+                    key,
+                    status.get("matched"),
+                    status.get("valid"),
+                    status.get("reason"),
+                )
+                if (
+                    prev
+                    and prev.get("valid")
+                    and not status.get("valid")
+                    and self.config_mgr.config.get("notify_cookie_invalid", True)
+                ):
+                    self._notify_cookie_invalid(status)
+        valid_cnt = len([r for r in reports if r.get("valid")])
+        invalid_cnt = len([r for r in reports if r.get("matched") and not r.get("valid")])
+        unmatched_cnt = len([r for r in reports if not r.get("matched")])
+        logger.info(
+            "Cookie检测结束：有效=%s 失效=%s 未匹配=%s 总计=%s",
+            valid_cnt,
+            invalid_cnt,
+            unmatched_cnt,
+            len(reports),
+        )
+        return reports
+
+    def _notify_cookie_invalid(self, status: Dict[str, Any]):
+        title = f"Cookie 失效：{status.get('site_name', status.get('site_key'))}"
+        text = (
+            f"站点 {status.get('site_name')} Cookie 已失效。\n"
+            f"原因：{status.get('reason') or '未知'}\n"
+            f"时间：{status.get('checked_at')}"
+        )
+        try:
+            self.plugin.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text=text,
+            )
+        except Exception as exc:
+            logger.error("发送 Cookie 失效通知失败: %s", exc)
+
+
+# ----------------------------
+# 解析引擎
+# ----------------------------
+class ParserEngine:
+    """解析站点页面并执行等级与隐私判定。"""
+
+    def __init__(self, config_mgr: ConfigManager):
+        self.config_mgr = config_mgr
+
+    @staticmethod
+    def _normalize_level_text(value: str) -> Tuple[str, str]:
+        text = value.lower()
+        compact = re.sub(r"[^a-z0-9\u4e00-\u9fa5]+", "", text)
+        return text, compact
+
+    def _match_level_by_keywords(self, raw: str) -> Optional[str]:
+        text, compact = self._normalize_level_text(raw)
+        for kw, target in LEVEL_KEYWORDS:
+            kw_compact = kw.replace(" ", "")
+            if kw in text or kw_compact in compact:
+                return target
+        return None
+
+    @staticmethod
+    def _clean_text(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return " ".join(value.replace("\xa0", " ").split())
+
+    def _find_value_by_labels(self, soup: BeautifulSoup, labels: List[str]) -> Optional[str]:
+        """在表格类结构中通过标签查找相邻值。"""
+        if not soup:
+            return None
+        keys = [lbl.lower() for lbl in labels if lbl]
+
+        def _match(text: Any) -> bool:
+            if not isinstance(text, str):
+                return False
+            lower_text = text.strip().lower()
+            return any(k in lower_text for k in keys)
+
+        cells = soup.find_all(["td", "th"], string=_match)
+        for cell in cells:
+            text_in_cell = self._clean_text(cell.get_text(" ", strip=True))
+            if text_in_cell and "@" in text_in_cell:
+                # 支持“邮箱 xxx@example.com”同单元格写法
+                for kw in keys:
+                    if kw in text_in_cell.lower():
+                        cleaned = text_in_cell.replace(kw, "", 1).strip(" :：-")
+                        if cleaned:
+                            return cleaned
+            sibling = cell.find_next_sibling(["td", "th"])
+            if sibling:
+                candidate = self._clean_text(sibling.get_text(" ", strip=True))
+                if candidate:
+                    return candidate
+            parent = cell.parent
+            if parent:
+                siblings = [c for c in parent.find_all(["td", "th"]) if c is not cell]
+                for sib in siblings:
+                    candidate = self._clean_text(sib.get_text(" ", strip=True))
+                    if candidate:
+                        return candidate
+        return None
+
+    def normalize_level(self, raw: str, overrides: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], Optional[int]]:
+        if not raw:
+            return None, None
+        normalized_candidate = raw.strip()
+        override_map = {k.lower(): v for k, v in (overrides or {}).items()}
+        candidate_l = normalized_candidate.lower()
+        if candidate_l in override_map:
+            normalized_candidate = override_map[candidate_l]
+        elif candidate_l in DEFAULT_LEVEL_ALIASES:
+            normalized_candidate = DEFAULT_LEVEL_ALIASES[candidate_l]
+        else:
+            fuzzy_match = self._match_level_by_keywords(normalized_candidate)
+            if fuzzy_match:
+                normalized_candidate = fuzzy_match
+        try:
+            index = LEVEL_ORDER.index(normalized_candidate) + 1
+            return normalized_candidate, index
+        except ValueError:
+            return normalized_candidate, None
+
+    def detect_privacy(self, html_text: str, email: Optional[str], username: Optional[str]) -> str:
+        text_lower = (html_text or "").lower()
+        for kw in HIGH_PRIVACY_KEYWORDS:
+            if kw.lower() in text_lower:
+                return "high"
+        # 页面仅露出用户名，邮箱缺失，通常为隐私中等
+        if username and not email:
+            # 页面同时出现“拒绝访问/保护隐私”时提升为高隐私
+            if any(k in text_lower for k in ("拒绝访问", "被用户", "隐私")):
+                return "high"
+            return "mid"
+        if username and email:
+            return "low"
+        # 既无邮箱也无用户名时默认中隐私
+        return "mid"
+
+    def parse_page(
+        self, html: str, site_key: str = "", overrides: Optional[Dict[str, Any]] = None, strip_nav: bool = True
+    ) -> Dict[str, Any]:
+        rules = overrides or {}
+        # 优先使用远端配置里的解析规则与等级映射
+        parse_overrides = (self.config_mgr.remote_config_cache or {}).get("parse_overrides") or {}
+        if site_key and site_key in parse_overrides and not overrides:
+            rules = parse_overrides.get(site_key) or {}
+        level_alias_source = rules.get("level_aliases") or (self.config_mgr.remote_config_cache or {}).get("level_aliases") or {}
+        base_url = rules.get("base_url") or ""
+        uid_from_url = None
+        try:
+            uid_from_url = parse_qs(urlparse(base_url).query).get("id", [None])[0]
+        except Exception:
+            uid_from_url = None
+
+        soup = BeautifulSoup(html, "html.parser")
+        # 去除全局导航/头部区域，避免拿到当前登录用户昵称
+        if strip_nav:
+            try:
+                for node in soup.select("#nav_block, #info_block"):
+                    node.decompose()
+            except Exception:
+                pass
+
+        def _is_valid_username(text: str) -> bool:
+            if not text:
+                return False
+            text_clean = self._clean_text(text)
+            if not text_clean or len(text_clean) > 32:
+                return False
+            banned = ["上传量", "下载量", "考核", "需要", "邀请", "魔力值", "天", "小时", "hour", "day"]
+            return not any(b in text_clean for b in banned)
+
+        def _sanitize_username_candidate(text: str) -> str:
+            """尽量提取疑似用户名的最短片段。"""
+            if not text:
+                return ""
+            cleaned = self._clean_text(text)
+            # 切掉分隔符后的站点名/标语
+            for sep in ("|", "｜", "-", "—"):
+                if sep in cleaned:
+                    cleaned = cleaned.split(sep)[0].strip()
+            # 取第一个空白前的片段
+            if " " in cleaned:
+                cleaned = cleaned.split(" ")[0].strip()
+            return cleaned
+
+        username = None
+        email = None
+        level_raw = None
+        profile_url = None
+        register_time = None
+        site_key_l = (site_key or "").lower()
+        base_url_l = (base_url or "").lower()
+        is_open_cd = site_key_l in ("opencd", "open.cd", "open_cd") or "open.cd" in base_url_l
+
+
+        # 用户名解析：优先自定义选择器/正则
+        if rules.get("username_selector"):
+            tag = soup.select_one(rules["username_selector"])
+            if tag and tag.get_text(strip=True):
+                username = tag.get_text(strip=True)
+        if not username and rules.get("username_regex"):
+            m = re.search(rules["username_regex"], html or "", re.IGNORECASE | re.MULTILINE)
+            if m:
+                username = m.group(1).strip()
+        if not username:
+            title_tag = soup.find("title")
+            if title_tag and title_tag.text:
+                m_title = re.search(r"用户详情\s*-\s*([^-|]+)", title_tag.text)
+                if m_title:
+                    title_name = _sanitize_username_candidate(m_title.group(1))
+                    if _is_valid_username(title_name):
+                        username = title_name
+        if not username:
+            h1_tag = soup.find("h1") or soup.select_one("#outer h1")
+            if h1_tag:
+                # 优先 h1 内的个人链接
+                link_h1 = None
+                if uid_from_url:
+                    link_h1 = h1_tag.find("a", href=lambda href: href and "userdetails" in href.lower() and f"id={uid_from_url}" in href)
+                if not link_h1:
+                    link_h1 = h1_tag.find("a", href=lambda href: href and "userdetails" in href.lower())
+                if link_h1 and link_h1.get_text(strip=True):
+                    candidate = _sanitize_username_candidate(link_h1.get_text(strip=True))
+                    if _is_valid_username(candidate):
+                        username = candidate
+                if not username:
+                    h1_texts = [s.strip() for s in h1_tag.stripped_strings if s and s.strip()]
+                    if h1_texts:
+                        candidate = _sanitize_username_candidate(h1_texts[0])
+                        if _is_valid_username(candidate):
+                            username = candidate
+            if not username:
+                username_tag = soup.select_one("#outer h1 b") or soup.select_one("h1 b")
+                if username_tag and username_tag.text:
+                    candidate = _sanitize_username_candidate(username_tag.text)
+                    if _is_valid_username(candidate):
+                        username = candidate
+        if not username:
+            # 根据 userdetails 链接提取（优先匹配当前 UID）
+            link_tag = None
+            if uid_from_url:
+                link_tag = soup.find(
+                    "a",
+                    href=lambda href: href and "userdetails" in href.lower() and f"id={uid_from_url}" in href,
+                )
+            if not link_tag:
+                # 退化到任意 userdetails 链接，但仅接受疑似用户名的短文本
+                for candidate_link in soup.find_all("a", href=lambda href: href and "userdetails" in href.lower()):
+                    candidate_text = _sanitize_username_candidate(candidate_link.get_text(strip=True))
+                    if _is_valid_username(candidate_text):
+                        link_tag = candidate_link
+                        break
+            if link_tag and link_tag.get_text(strip=True):
+                candidate = _sanitize_username_candidate(link_tag.get_text(strip=True))
+                if _is_valid_username(candidate):
+                    username = candidate
+        if not username:
+            nowrap_spans = soup.find_all("span", class_=lambda c: c and "nowrap" in c.split())
+            for span in nowrap_spans:
+                link = None
+                if uid_from_url:
+                    link = span.find(
+                        "a",
+                        href=lambda href: href and "userdetails" in href.lower() and f"id={uid_from_url}" in href,
+                    )
+                if not link:
+                    link = span.find("a", href=lambda href: href and "userdetails" in href.lower())
+                if link and link.get_text(strip=True):
+                    candidate = _sanitize_username_candidate(link.get_text(strip=True))
+                    if _is_valid_username(candidate):
+                        username = candidate
+                        break
+                text_iter = (s.strip() for s in span.stripped_strings if s and s.strip())
+                username_candidate = next(text_iter, None)
+                candidate = _sanitize_username_candidate(username_candidate) if username_candidate else None
+                if candidate and _is_valid_username(candidate):
+                    username = candidate
+                    break
+        if not username:
+            label_username = self._find_value_by_labels(soup, ["用户名", "用戶名", "nickname", "user name"])
+            if label_username:
+                username = self._clean_text(label_username)
+
+        # 邮箱解析
+        mail_link = None
+        if rules.get("email_selector"):
+            mail_link = soup.select_one(rules["email_selector"])
+        if not mail_link:
+            mail_link = soup.find("a", href=lambda href: href and href.startswith("mailto:"))
+        if mail_link:
+            email = mail_link.text.strip() or (mail_link.get("href", "").split(":")[1] if mail_link.get("href") else None)
+        else:
+            email_td = soup.find("td", string=lambda s: isinstance(s, str) and ("邮箱" in s or "email" in s.lower()))
+            if email_td and email_td.find_next_sibling("td"):
+                candidate = email_td.find_next_sibling("td")
+                mail_tag = candidate.find("a", href=lambda href: href and href.startswith("mailto:"))
+                if mail_tag:
+                    email = mail_tag.text.strip()
+                else:
+                    candidate_text = candidate.get_text(strip=True)
+                    if "@" in candidate_text:
+                        email = candidate_text
+        if not email:
+            email_label_value = self._find_value_by_labels(soup, ["邮箱", "email", "e-mail", "mail"])
+            if email_label_value and "@" in email_label_value:
+                email = self._clean_text(email_label_value)
+            if not email and rules.get("email_regex"):
+                m = re.search(rules["email_regex"], html or "", re.IGNORECASE)
+                if m:
+                    email = m.group(1).strip()
+            if not email:
+                # 最终回退：先尝试“邮箱 xxx”模式，再扫描第一个邮箱
+                text_all = soup.get_text(" ", strip=True) or ""
+                m_label_email = re.search(r"(邮箱|email)[：: ]+([\\w.+'%-]+@[\\w.-]+)", text_all, re.IGNORECASE)
+                if m_label_email:
+                    email = m_label_email.group(2).strip()
+                if not email:
+                    match = re.search(r"[\\w.+'%-]+@[\\w.-]+", text_all)
+                if match:
+                    email = match.group(0).strip()
+        # OpenCD 页脚的联系邮箱，若无个人邮箱则应忽略
+        if is_open_cd and email and email.lower() == "opencd.service@gmail.com":
+            email = None
+
+        # 等级解析
+        level_td = None
+        if rules.get("level_selector"):
+            level_td = soup.select_one(rules["level_selector"])
+        if not level_td:
+            level_td = soup.find("td", string=lambda s: isinstance(s, str) and ("等级" in s or "class" in s.lower()))
+            if level_td:
+                level_td = level_td.find_next_sibling("td") or level_td
+        if level_td:
+            img = level_td.find("img", title=True)
+            if img and img.get("title"):
+                level_raw = img["title"].strip()
+            else:
+                text = level_td.get_text(strip=True)
+                if text:
+                    level_raw = text
+        if not level_raw and rules.get("level_regex"):
+            m = re.search(rules["level_regex"], html or "", re.IGNORECASE)
+            if m:
+                level_raw = m.group(1).strip()
+        if not level_raw:
+            level_by_label = self._find_value_by_labels(soup, ["等级", "class", "用户组", "等級", "级别"])
+            if level_by_label:
+                level_raw = self._clean_text(level_by_label)
+        # 兜底：扫描页面内所有等级图标
+        if not level_raw:
+            src_level_map = {
+                "nexus": "Nexus Master",
+                "ultimate": "Ultimate User",
+                "extreme": "Extreme User",
+                "veteran": "Veteran User",
+                "insane": "Insane User",
+                "crazy": "Crazy User",
+                "elite": "Elite User",
+                "power": "Power User",
+                "user": "User",
+                "peasant": "Peasant",
+            }
+            for img in soup.find_all("img"):
+                cand_text = img.get("title") or img.get("alt") or ""
+                cand_text = self._clean_text(cand_text)
+                if cand_text:
+                    fuzzy = self._match_level_by_keywords(cand_text)
+                    if fuzzy:
+                        level_raw = cand_text
+                        break
+                src = img.get("src") or ""
+                fname = urlparse(src).path.lower()
+                for key, val in src_level_map.items():
+                    if key in fname:
+                        level_raw = val
+                        break
+                if level_raw:
+                    break
+        if level_raw:
+            level_raw = self._clean_text(level_raw)
+
+        # 个人主页链接（用于二次解析）
+        if rules.get("profile_selector"):
+            link_tag = soup.select_one(rules["profile_selector"])
+            if link_tag and link_tag.get("href"):
+                profile_url = urljoin(base_url, link_tag["href"])
+        if not profile_url:
+            link_tag = soup.find("a", href=lambda href: href and "userdetails" in href.lower())
+            if link_tag and link_tag.get("href"):
+                profile_url = urljoin(base_url, link_tag["href"]) if base_url else link_tag["href"]
+
+        # 注册时间解析
+        if rules.get("register_time_selector"):
+            reg_tag = soup.select_one(rules["register_time_selector"])
+            if reg_tag:
+                register_time = self._clean_text(reg_tag.get_text(" ", strip=True))
+        if not register_time and rules.get("register_time_regex"):
+            m = re.search(rules["register_time_regex"], html or "", re.IGNORECASE)
+            if m:
+                register_time = self._clean_text(m.group(1))
+        if not register_time:
+            register_time = self._find_value_by_labels(
+                soup,
+                ["注册时间", "加入日期", "入站时间", "join date", "registration date", "加入时间"],
+            )
+            if register_time:
+                register_time = self._clean_text(register_time.split("(")[0])
+        if not register_time:
+            m = re.search(
+                r"(注册时间|加入日期|Join Date)[：: ]+([^<\\n]+)",
+                soup.get_text(" ", strip=True),
+                re.IGNORECASE,
+            )
+            if m:
+                register_time = self._clean_text(m.group(2).split("(")[0])
+
+        # 针对 OpenCD 主页的定向兜底：优先取表格行中的邮箱/等级/加入日期，避免页脚邮箱误判
+        if is_open_cd:
+            # 行值提取器：从包含标签的单元格拿到下一个 td 的文本/链接
+            def _row_value(label_keywords: List[str]) -> Tuple[Optional[str], Optional[Any]]:
+                cell = soup.find("td", string=lambda s: isinstance(s, str) and any(k in s for k in label_keywords))
+                if not cell:
+                    return None, None
+                value_td = cell.find_next_sibling("td") or cell
+                mail_tag = value_td.find("a", href=lambda href: href and href.startswith("mailto:"))
+                if mail_tag and mail_tag.text:
+                    return mail_tag.text.strip(), value_td
+                text_val = value_td.get_text(" ", strip=True) or None
+                return self._clean_text(text_val) if text_val else None, value_td
+
+            email_val, email_td_node = _row_value(["邮箱", "email", "Email"])
+            if email_val and (not email or email.lower() == "opencd.service@gmail.com"):
+                email = email_val
+
+            level_val, level_td_node = _row_value(["等级", "class", "用户组", "級別", "等級"])
+            if level_td_node:
+                img = level_td_node.find("img", title=True) or level_td_node.find("img", alt=True)
+                if img and (img.get("title") or img.get("alt")):
+                    level_val = self._clean_text(img.get("title") or img.get("alt"))
+            if level_val and (not level_raw or level_raw.lower() == level_val.lower() or self.normalize_level(level_raw)[1] is None):
+                level_raw = level_val
+
+            reg_val, _ = _row_value(["加入日期", "注册时间", "入站时间", "Join Date"])
+            if reg_val:
+                reg_val = reg_val.split("(")[0].strip()
+            if reg_val and not register_time:
+                register_time = reg_val
+
+        # 标准化等级（支持自定义映射）
+        level_standard, level_index = self.normalize_level(level_raw, level_alias_source)
+
+        privacy = self.detect_privacy(html, email, username)
+        return {
+            "username": username,
+            "email": email,
+            "level_raw": level_raw,
+            "level_standard": level_standard,
+            "level_index": level_index,
+            "privacy_level": privacy,
+            "profile_url": profile_url,
+            "register_time": register_time,
+        }
+
+
+# ----------------------------
+# 审核流程引擎
+# ----------------------------
+class ReviewEngine:
+    """执行自动审核完整流程。"""
+
+    SKIP_CACHE_HOURS = 48
+
+    def __init__(self, plugin: "_PluginBase", config: ConfigManager, registry: SiteRegistry, parser: ParserEngine):
+        self.plugin = plugin
+        self.config_mgr = config
+        self.registry = registry
+        self.parser = parser
+        self.running = False
+        self.stats = plugin.get_data("review_health_stats") or {
+            "approve": 0,
+            "reject": 0,
+            "failed": 0,
+            "skipped_no_cookie": 0,
+        }
+        self.skip_history = plugin.get_data("skip_history") or {}
+        self._cleanup_skip_history()
+
+    def _parse_ts(self, ts: Optional[str]) -> Optional[datetime]:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return None
+
+    def _cleanup_skip_history(self):
+        now = datetime.now()
+        changed = False
+        for app_id, info in list(self.skip_history.items()):
+            ts = self._parse_ts((info or {}).get("timestamp"))
+            if not ts or now - ts >= timedelta(hours=self.SKIP_CACHE_HOURS):
+                self.skip_history.pop(app_id, None)
+                changed = True
+        if changed:
+            self.plugin.save_data("skip_history", self.skip_history)
+
+    def _should_bypass_application(self, app_id: Any) -> bool:
+        entry = self.skip_history.get(app_id)
+        if not entry:
+            return False
+        ts = self._parse_ts(entry.get("timestamp"))
+        if not ts:
+            self.skip_history.pop(app_id, None)
+            self.plugin.save_data("skip_history", self.skip_history)
+            return False
+        elapsed = datetime.now(ts.tzinfo) - ts
+        if elapsed < timedelta(hours=self.SKIP_CACHE_HOURS):
+            sites = entry.get("sites") or []
+            logger.info(
+                "申请 %s 在 %s 因缺少站点匹配或 Cookie 已跳过，48 小时内不重复审核。缺失站点=%s",
+                app_id,
+                ts.isoformat(),
+                ",".join(sites) if sites else "未知",
+            )
+            return True
+        self.skip_history.pop(app_id, None)
+        self.plugin.save_data("skip_history", self.skip_history)
+        return False
+
+    # --- 通用请求 ---
+    def _api_client(self) -> RequestUtils:
+        headers = {"Authorization": f"Bearer {self.config_mgr.api_token}", "Content-Type": "application/json"}
+        return RequestUtils(headers=headers, timeout=30, proxies=self.config_mgr.api_proxies)
+
+    def _full_url(self, path: str) -> str:
+        return f"{self.config_mgr.api_base.rstrip('/')}{path}"
+
+    # --- 上游 API ---
+    def sync_remote_config(self):
+        logger.debug("开始同步审核系统配置")
+        if not self.config_mgr.api_token:
+            logger.warning("未配置 API Token，无法同步审核配置")
+            return
+        if not self.config_mgr.should_sync_remote():
+            logger.debug("配置同步跳过：未到同步间隔")
+            return
+        try:
+            res = self._api_client().get_res(self._full_url("/api/v1/site-verifications/config"))
+            if res and res.status_code == 200:
+                data = res.json() or {}
+                if str(data.get("ret")) == "0":
+                    self.config_mgr.update_remote_cache(data.get("data") or {})
+                    logger.info("审核系统配置同步成功")
+                else:
+                    logger.error("同步审核配置失败：ret=%s, msg=%s", data.get("ret"), data.get("msg"))
+            else:
+                logger.error("同步审核配置失败，HTTP 状态码：%s", res.status_code if res else "无响应")
+        except Exception as exc:
+            logger.error("同步审核配置异常: %s", exc)
+
+    def fetch_pending(self) -> List[Dict[str, Any]]:
+        logger.debug("开始获取待审核列表(auto_status=none)")
+        query = {"auto_status": "none", "page": 1, "per_page": 50}
+        res = self._api_client().get_res(self._full_url("/api/v1/site-verifications"), params=query)
+        if not res or res.status_code != 200:
+            logger.error("获取待审核列表失败，HTTP 状态码：%s", res.status_code if res else "无响应")
+            return []
+        try:
+            payload = res.json()
+        except Exception as exc:
+            logger.error("解析待审核列表失败: %s", exc)
+            return []
+        if str(payload.get("ret")) != "0":
+            logger.error("获取待审核列表返回错误：%s", payload.get("msg"))
+            return []
+        data_list = payload.get("data", {}).get("data") or []
+        logger.info("获取待审核列表成功，数量=%s", len(data_list))
+        return data_list
+
+    def fetch_logs(self):
+        logger.debug("开始获取审核日志")
+        if not self.config_mgr.should_fetch_logs():
+            logger.debug("获取审核日志跳过：未到刷新间隔")
+            return
+        res = self._api_client().get_res(self._full_url("/api/v1/site-verifications/logs"))
+        if not res or res.status_code != 200:
+            logger.error("获取审核日志失败：HTTP %s", res.status_code if res else "无响应")
+            return
+        try:
+            payload = res.json()
+            if str(payload.get("ret")) == "0":
+                self.plugin.save_data("review_logs", payload.get("data") or [])
+                self.config_mgr.record_log_fetch()
+                logger.info("审核日志拉取成功，条数=%s", len(payload.get("data") or []))
+        except Exception as exc:
+            logger.error("解析审核日志失败: %s", exc)
+
+    def lock_application(self, app_id: Any) -> bool:
+        res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/lock"))
+        if not res or res.status_code != 200:
+            logger.error("申请 %s 加锁 HTTP 失败：%s", app_id, res.status_code if res else "无响应")
+            return False
+        try:
+            payload = res.json()
+        except Exception:
+            logger.error("申请 %s 加锁响应解析失败", app_id)
+            return False
+        if str(payload.get("ret")) == "0":
+            logger.info("申请 %s 加锁成功", app_id)
+            return True
+        logger.error("申请 %s 加锁返回失败：%s", app_id, payload.get("msg"))
+        return False
+
+    def unlock_application(self, app_id: Any, remark: str):
+        body = {"remark": self._trim_remark(remark)}
+        try:
+            res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/unlock"), json=body)
+            if not res:
+                logger.error("申请 %s 解锁失败：无响应", app_id)
+                return
+            payload = res.json()
+            if str(payload.get("ret")) != "0":
+                logger.error("解锁申请 %s 失败：%s", app_id, payload.get("msg"))
+            else:
+                logger.info("申请 %s 解锁成功", app_id)
+        except Exception as exc:
+            logger.error("解锁申请 %s 时异常: %s", app_id, exc)
+
+    def update_status(self, app_id: Any, action: str, remark: str) -> bool:
+        payload = {"action": action, "remark": self._trim_remark(remark)}
+        retries = self.config_mgr.status_retry_count
+        interval = self.config_mgr.status_retry_interval
+        for idx in range(retries):
+            res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/status"), json=payload)
+            if not res or res.status_code != 200:
+                logger.error("状态更新失败(HTTP) #%s/%s：%s", idx + 1, retries, res.status_code if res else "无响应")
+            else:
+                try:
+                    data = res.json()
+                    if str(data.get("ret")) == "0":
+                        return True
+                    logger.warning("状态更新返回错误 #%s/%s：%s", idx + 1, retries, data.get("msg"))
+                except Exception as exc:
+                    logger.error("解析状态更新响应失败：%s", exc)
+            if idx < retries - 1:
+                time.sleep(interval)
+        logger.error("申请 %s 状态更新最终失败，action=%s", app_id, action)
+        return False
+
+    # --- 核心流程 ---
+    def run_review(self):
+        if self.running:
+            logger.warning("自动审核任务仍在运行，跳过本轮")
+            return
+        if not self.config_mgr.enabled:
+            logger.debug("自动审核跳过：插件未启用")
+            return
+        if not self.config_mgr.api_token:
+            logger.warning("未配置 API Token，自动审核停止")
+            return
+        test_url = self.config_mgr.should_run_test_parse()
+        if test_url:
+            self._run_test_parse(test_url)
+
+        if not self.config_mgr.auto_review_enabled_remote:
+            logger.info("远端关闭自动审核，保留检测任务")
+            return
+        self.running = True
+        try:
+            logger.info("自动审核任务开始")
+            self.sync_remote_config()
+            self.registry.refresh()
+            apps = self.fetch_pending()
+            for app in apps:
+                self._process_application(app)
+            self.fetch_logs()
+        finally:
+            logger.info("自动审核任务结束")
+            self.running = False
+
+    def _process_application(self, application: Dict[str, Any]):
+        app_id = application.get("id")
+        site_accounts = application.get("site_accounts") or []
+        target_email = (application.get("target_email") or "").lower()
+        target_username = (application.get("target_username") or "").lower()
+        if self._should_bypass_application(app_id):
+            return
+        skipped_sites = []
+        site_results = []
+
+        # 缺少 Cookie 直接跳过
+        for account in site_accounts:
+            match = self.registry.match_site_account(account)
+            if not match or not match.get("has_cookie"):
+                skipped_sites.append(account.get("name") or account.get("site_key"))
+        if skipped_sites:
+            self.stats["skipped_no_cookie"] += 1
+            self.plugin.save_data("review_health_stats", self.stats)
+            self.skip_history[app_id] = {
+                "sites": skipped_sites,
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.plugin.save_data("skip_history", self.skip_history)
+            logger.warning(
+                "申请 %s 缺少站点匹配或 Cookie，跳过并缓存 48 小时，缺失站点=%s", app_id, ",".join(skipped_sites)
+            )
+            return
+
+        # 锁定
+        locked = self.lock_application(app_id)
+        if not locked:
+            logger.error("申请 %s 加锁失败，跳过", app_id)
+            return
+
+        try:
+            for account in site_accounts:
+                site_result = self._review_site(application, account, target_username, target_email)
+                site_results.append(site_result)
+                if site_result.get("error"):
+                    break
+
+            decision = self._decide(application, site_results)
+            if decision["action"] == "unlock":
+                self.unlock_application(app_id, decision["remark"])
+                self.stats["failed"] += 1
+                self._notify_exception(application, decision["remark"])
+            else:
+                ok = self.update_status(app_id, decision["action"], decision["remark"])
+                if ok:
+                    if decision["action"] == "approve":
+                        self.stats["approve"] += 1
+                    elif decision["action"] == "reject":
+                        self.stats["reject"] += 1
+                    logger.info("申请 %s 状态提交成功：%s", app_id, decision["action"])
+                    if self.config_mgr.config.get("notify_review_result", True):
+                        self._notify_review_result(application, decision, site_results)
+                else:
+                    self.unlock_application(app_id, "审核结果已生成但状态更新失败，请人工处理。")
+                    self.stats["failed"] += 1
+                    self._notify_exception(application, "调用 /status 失败，已自动解锁")
+            self.plugin.save_data("review_health_stats", self.stats)
+        except Exception as exc:
+            logger.error("处理申请 %s 时异常：%s", app_id, exc)
+            self.unlock_application(app_id, f"自动审核失败: {exc}")
+            self.stats["failed"] += 1
+            self.plugin.save_data("review_health_stats", self.stats)
+            self._notify_exception(application, f"自动审核异常：{exc}")
+        finally:
+            logger.info("申请 %s 处理结束", app_id)
+
+    def _run_test_parse(self, url: str):
+        """手工测试解析指定链接，仅输出日志。"""
+        try:
+            logger.info("开始测试解析：url=%s", url)
+            cookie = None
+            ua = settings.USER_AGENT
+            try:
+                if self.registry:
+                    self.registry.refresh()
+                    host = urlparse(url).netloc.lower()
+                    match = next(
+                        (
+                            site
+                            for site in self.registry.site_mapping.values()
+                            if (site.get("domain") or "").lower() == host
+                            or urlparse((site.get("remote") or {}).get("url") or "").netloc.lower() == host
+                        ),
+                        None,
+                    )
+                    if match and match.get("local"):
+                        cookie = match["local"].get("cookie")
+                        ua = match["local"].get("ua") or ua
+            except Exception:
+                pass
+            headers = {"User-Agent": ua}
+            if cookie:
+                headers["Cookie"] = cookie
+
+            req = RequestUtils(headers=headers, timeout=30)
+            res = None
+            for _ in range(5):
+                res = req.get_res(url, allow_redirects=True, verify=False)
+                if res and res.status_code == 200:
+                    break
+                time.sleep(1)
+            if not res or res.status_code != 200:
+                logger.error("测试解析失败：HTTP %s", res.status_code if res else "无响应")
+                return
+            parsed = self.parser.parse_page(res.text, overrides={"base_url": url})
+            logger.info(
+                "测试解析完成 用户=%s 邮箱=%s 等级=%s 注册时间=%s",
+                parsed.get("username"),
+                parsed.get("email"),
+                parsed.get("level_standard") or parsed.get("level_raw"),
+                parsed.get("register_time"),
+            )
+        except Exception as exc:
+            logger.error("测试解析异常：%s", exc)
+
+    def _review_site(
+        self,
+        application: Dict[str, Any],
+        account: Dict[str, Any],
+        target_username: str,
+        target_email: str,
+    ) -> Dict[str, Any]:
+        site_key = account.get("site_key") or account.get("key")
+        verification_url = account.get("verification_url") or ""
+        if not verification_url and account.get("query_template") and account.get("uid"):
+            verification_url = (account["query_template"] or "").format(account.get("url") or "", account.get("uid"))
+
+        match = self.registry.match_site_account(account) or {}
+        local_site = match.get("local") or {}
+        cookie = local_site.get("cookie")
+        ua = local_site.get("ua") or settings.USER_AGENT
+        logger.debug("开始解析站点 %s，验证链接=%s", site_key, verification_url)
+        result = {
+            "site_key": site_key,
+            "site_name": account.get("name") or site_key,
+            "username_match": False,
+            "email_match": False,
+            "level_ok": False,
+            "privacy_level": "mid",
+            "error": None,
+        }
+
+        if not verification_url:
+            result["error"] = "缺少验证链接"
+            return result
+        try:
+            req = RequestUtils(headers={"Cookie": cookie, "User-Agent": ua}, timeout=45)
+            res = None
+            for idx in range(5):
+                res = req.get_res(verification_url, allow_redirects=True, verify=False)
+                if res and res.status_code == 200:
+                    break
+                time.sleep(1)
+            if not res:
+                result["error"] = "访问失败：无响应"
+                return result
+            if res.status_code in (301, 302) and "login" in (res.headers.get("Location") or "").lower():
+                result["error"] = "Cookie 失效，跳转登录"
+                return result
+            if res.status_code != 200:
+                result["error"] = f"访问失败：HTTP {res.status_code}"
+                return result
+            parsed = self.parser.parse_page(
+                res.text,
+                site_key=site_key,
+                overrides={
+                    **self.config_mgr.parse_rule(site_key),
+                    "level_aliases": self.config_mgr.level_aliases(site_key),
+                    "base_url": verification_url,
+                },
+                strip_nav=True,
+            )
+            result.update(parsed)
+            result["username_match"] = bool(
+                parsed.get("username") and target_username and parsed["username"].lower() == target_username
+            )
+            result["email_match"] = bool(
+                parsed.get("email") and target_email and parsed["email"].lower() == target_email
+            )
+            min_level = self.config_mgr.min_user_class
+            try:
+                min_idx = LEVEL_ORDER.index(min_level) + 1
+            except ValueError:
+                min_idx = None
+            if parsed.get("level_index") and min_idx:
+                result["level_ok"] = parsed["level_index"] >= min_idx
+            else:
+                result["level_ok"] = False
+            logger.debug(
+                "站点 %s 解析完成 用户匹配=%s 邮箱匹配=%s 等级通过=%s 隐私=%s 注册时间=%s",
+                site_key,
+                result["username_match"],
+                result["email_match"],
+                result["level_ok"],
+                result["privacy_level"],
+                result.get("register_time"),
+            )
+            return result
+        except Exception as exc:
+            result["error"] = f"解析异常: {exc}"
+            return result
+
+    def _decide(self, application: Dict[str, Any], results: List[Dict[str, Any]]) -> Dict[str, str]:
+        has_error = any(r.get("error") for r in results)
+        has_privacy_block = any(r.get("privacy_level") in ("high", "mid") for r in results)
+        verification_level = self.config_mgr.verification_level
+        require_username_match = verification_level == "high"
+        username_mismatch = any(not r.get("username_match") for r in results) if require_username_match else False
+        email_mismatch = any(not r.get("email_match") for r in results)
+        level_issue = any(not r.get("level_ok") for r in results)
+
+        if has_error:
+            reason = "; ".join([r.get("error") for r in results if r.get("error")][:3])
+            return {"action": "unlock", "remark": f"自动审核失败：{reason}"}
+        if has_privacy_block or username_mismatch or email_mismatch or level_issue:
+            remark = self._build_reject_remark(results)
+            return {"action": "reject", "remark": remark}
+        remark = self._build_approve_remark(results, application)
+        return {"action": "approve", "remark": remark}
+
+    def _verification_requirement_text(self) -> str:
+        level = self.config_mgr.verification_level
+        if level == "low":
+            return "验证等级：low（仅校验邮箱一致性）"
+        return "验证等级：high（校验用户名与邮箱一致性）"
+
+    def _build_approve_remark(self, results: List[Dict[str, Any]], application: Dict[str, Any]) -> str:
+        lines = ["✅ 自动审核通过。", self._verification_requirement_text(), "", "站点结果："]
+
+        def _flag(val: bool) -> str:
+            return "✅" if val else "❌"
+
+        for item in results:
+            lines.extend(
+                [
+                    f"• {item.get('site_name')}：",
+                    f"  - 用户：{item.get('username') or '未知'}",
+                    f"  - 邮箱：{item.get('email') or '未知'}",
+                    f"  - 等级：{item.get('level_standard') or item.get('level_raw') or '未知'}",
+                    f"  - 注册：{item.get('register_time') or '未知'}",
+                    f"  - 匹配：U{_flag(item.get('username_match'))} / E{_flag(item.get('email_match'))} / L{_flag(item.get('level_ok'))}",
+                    "",
+                ]
+            )
+        if application.get("type") == "invite":
+            lines.append("🎟️ 邀请名额将由系统自动扣减并发送邮件。")
+        return self._trim_remark("\n".join(lines).rstrip())
+
+    def _build_reject_remark(self, results: List[Dict[str, Any]]) -> str:
+        require_username_match = self.config_mgr.verification_level == "high"
+        parts = ["❌ 自动审核拒绝。", "您所使用的邀请权限已自动退回。", self._verification_requirement_text(), ""]
+        passed_blocks: List[str] = []
+        issue_blocks: List[str] = []
+
+        def _flag(val: bool) -> str:
+            return "✅" if val else "❌"
+
+        for item in results:
+            reasons = []
+            if item.get("privacy_level") in ("high", "mid"):
+                reasons.append(f"隐私设置过高({item.get('privacy_level')})，请调整为低隐私并确保邮箱可见")
+            if require_username_match and not item.get("username_match"):
+                reasons.append("用户名不匹配")
+            if not item.get("email"):
+                reasons.append("邮箱不可见，可能因隐私设置导致，请开启低隐私确保邮箱可见")
+            elif not item.get("email_match"):
+                reasons.append("检测到邮箱与申请邮箱不符")
+            if not item.get("level_ok"):
+                reasons.append("等级不达标或无法识别")
+            if item.get("error"):
+                reasons.append(item["error"])
+            block = [
+                f"{item.get('site_name')}：",
+                f"- 用户：{item.get('username') or '未知'}",
+                f"- 邮箱：{item.get('email') or '未知'}",
+                f"- 等级：{item.get('level_standard') or item.get('level_raw') or '未知'}",
+                f"- 注册：{item.get('register_time') or '未知'}",
+                f"- 匹配：U{_flag(item.get('username_match'))} / E{_flag(item.get('email_match'))} / L{_flag(item.get('level_ok'))}",
+            ]
+            if reasons:
+                block.append(f"- 原因：{'；'.join(reasons)}")
+                block.append("")
+                issue_blocks.extend(block)
+            else:
+                block.append("- 状态：通过")
+                block.append("")
+                passed_blocks.extend(block)
+
+        if passed_blocks:
+            parts.extend(["✅ 已通过站点："] + passed_blocks)
+        if issue_blocks:
+            parts.extend(["⚠️ 存在问题："] + issue_blocks)
+        text = "\n".join(parts).rstrip()
+        return self._trim_remark(text or "信息不匹配")
+
+    def _trim_remark(self, text: str) -> str:
+        limit = 1000
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    # --- 通知 ---
+    def _notify_review_result(
+        self, application: Dict[str, Any], decision: Dict[str, str], results: List[Dict[str, Any]]
+    ):
+        title = f"审核结果：申请 {application.get('id')} {decision.get('action')}"
+        lines = [
+            f"申请类型：{application.get('type')}",
+            f"目标用户：{application.get('target_username')} / {application.get('target_email')}",
+            f"结果：{ '通过' if decision.get('action') == 'approve' else '拒绝' }",
+        ]
+        if decision.get("action") == "reject":
+            lines.append("您所使用的邀请权限已自动退回。")
+        lines.append("")
+        for item in results:
+            lines.append(
+                f"{item.get('site_name')}: 用户={item.get('username') or '未知'}, "
+                f"邮箱={item.get('email') or '未知'}, 等级={item.get('level_standard') or item.get('level_raw') or '未知'}, "
+                f"隐私={item.get('privacy_level')}, 匹配:U={'是' if item.get('username_match') else '否'} "
+                f"E={'是' if item.get('email_match') else '否'} L={'是' if item.get('level_ok') else '否'}"
+            )
+        lines.append("")
+        lines.append(decision.get("remark") or "")
+        try:
+            self.plugin.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text="\n".join(lines),
+            )
+        except Exception as exc:
+            logger.error("发送审核结果通知失败: %s", exc)
+
+    def _notify_exception(self, application: Dict[str, Any], reason: str):
+        if not self.config_mgr.config.get("notify_exception", True):
+            return
+        title = f"审核异常：申请 {application.get('id')}"
+        text = (
+            f"申请类型：{application.get('type')}\n"
+            f"目标用户：{application.get('target_username')} / {application.get('target_email')}\n"
+            f"原因：{reason}"
+        )
+        try:
+            self.plugin.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text=text,
+            )
+        except Exception as exc:
+            logger.error("发送异常通知失败: %s", exc)
+
+
+# ----------------------------
+# 插件主体
+# ----------------------------
 class LuckPTAutoReview(_PluginBase):
-    # 插件名称
-    plugin_name = "蜂巢邀请监控"
-    # 插件描述
-    plugin_desc = "蜂巢论坛管理组定制专用"
-    # 插件图标
-    plugin_icon = "https://pt.luckpt.de/logo1.png"
-    # 插件版本
-    plugin_version = "1.1.4"
-    # 插件作者
-    plugin_author = "miss"
-    # 作者主页
+    plugin_name = "LuckPT自动审核"
+    plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
+    plugin_icon = "https://github.com/Abel-j/MoviePilot-Plugins/blob/main/icons/LuckPT.png"
+    plugin_version = "3.0.0"
+    plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
-    # 插件配置项ID前缀
     plugin_config_prefix = "luckptautoreview_"
-    # 加载顺序
     plugin_order = 31
-    # 可使用的用户级别
     auth_level = 2
 
-    # 私有属性
-    _enabled = False
-    _notify = False
-    _cron = None
-    _onlyonce = False
-    _proxy = None
-    _username = None
-    _password = None
-    _check_interval = None
-    _pending_reviews = None
-    _retry_count = None
-    _retry_interval = None
-    _use_proxy = True
-    _auto_approve_enabled = False # 新增类属性
-    
-    # 定时器
-    _scheduler: Optional[BackgroundScheduler] = None
-    sites: Optional[SitesHelper] = None
+    def __init__(self):
+        super().__init__()
+        self.config_mgr: Optional[ConfigManager] = None
+        self.sites_helper = SitesHelper()
+        self.registry: Optional[SiteRegistry] = None
+        self.parser: Optional[ParserEngine] = None
+        self.review_engine: Optional[ReviewEngine] = None
+        self.scheduler: Optional[BackgroundScheduler] = None
 
-    # 定义不通过等级列表 (移到类级别或合适位置)
-    not_pass_levels = [
-        'Peasant', 'User', '无名小辈', '伯曼猫 USER', 
-        '(士兵)User', '(小鬼当家)User', '新人', '初级训练家(User)', 
-        '未找到等级信息', '无法访问/提取', '未提取到等级' # 加入提取失败的情况
-    ]
-
+    # -------------- 生命周期 --------------
     def init_plugin(self, config: dict = None):
-        self.sites = SitesHelper()
+        logger.info("初始化 LuckPTAutoReview 插件开始")
         self.stop_service()
+        self.config_mgr = ConfigManager(self, config)
+        self.registry = SiteRegistry(self, self.config_mgr, self.sites_helper)
+        self.parser = ParserEngine(self.config_mgr)
+        self.review_engine = ReviewEngine(self, self.config_mgr, self.registry, self.parser)
 
-        if config:
-            self._enabled = config.get("enabled", False)
-            self._notify = config.get("notify", True)
-            self._cron = config.get("cron")
-            self._onlyonce = config.get("onlyonce", False)
-            self._username = config.get("username")
-            self._password = config.get("password")
-            self._check_interval = config.get("check_interval", 5)
-            self._retry_count = int(config.get("retry_count", 3)) # 确保是整数
-            self._retry_interval = int(config.get("retry_interval", 5)) # 确保是整数
-            self._use_proxy = config.get("use_proxy", True)
-            self._auto_approve_enabled = config.get("auto_approve_enabled", False) # 读取新配置
-            self._pending_reviews = self.get_data('pending_reviews') or {}
+        # 保存后若填写了测试解析 URL，立即执行一次并清空配置
+        test_url = self.config_mgr.should_run_test_parse()
+        if test_url:
+            try:
+                self.review_engine._run_test_parse(test_url)
+            finally:
+                self.config_mgr.update_config({"test_parse_url": ""})
 
-        # 启动服务
-        if self._enabled:
-            # 创建独立的 scheduler 实例
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            
-            if self._onlyonce:
-                logger.info(f"监控蜂巢论坛邀请 (一次性任务注册)...")
-                # 立即执行一次检查，使用 run_date
-                self._scheduler.add_job(func=self.check_invites, trigger='date',
-                                   run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                   id=f"{self.__class__.__name__}_check_invite_once",
-                                   name=f"蜂巢邀请监控服务 (一次性)")
-                # 关闭一次性开关
-                self._onlyonce = False
-                # 添加 update_config 调用以保存 onlyonce 的状态
-                self.update_config({
-                    "enabled": self._enabled,
-                    "notify": self._notify,
-                    "cron": self._cron,
-                    "onlyonce": self._onlyonce, # <<< 确保保存为 False
-                    "username": self._username,
-                    "password": self._password,
-                    "check_interval": self._check_interval,
-                    "retry_count": self._retry_count,
-                    "retry_interval": self._retry_interval,
-                    "use_proxy": self._use_proxy,
-                    "auto_approve_enabled": self._auto_approve_enabled # 保存新配置
-                    # pending_reviews 是运行时数据，不应在此保存
-                })
-            
-            # 添加周期性任务
-            if self._cron:
-                logger.info(f"监控蜂巢论坛邀请服务启动，定时任务：{self._cron}")
-                try:
-                    # 使用 CronTrigger.from_crontab
-                    self._scheduler.add_job(func=self.check_invites,
-                                            trigger=CronTrigger.from_crontab(self._cron),
-                                            id=f"{self.__class__.__name__}_check_invite_cron",
-                                            name=f"蜂巢邀请监控服务 (Cron)")
-                except Exception as e:
-                    logger.error(f"添加 Cron 任务失败: {str(e)}")
-            # 添加间隔任务（仅当没有 cron 时）
-            elif self._check_interval and int(self._check_interval) > 0: 
-                logger.info(f"监控蜂巢论坛邀请服务启动，间隔：{self._check_interval}分钟")
-                try:
-                    self._scheduler.add_job(func=self.check_invites,
-                                            trigger="interval",
-                                            minutes=int(self._check_interval),
-                                            id=f"{self.__class__.__name__}_check_invite_interval",
-                                            name=f"蜂巢邀请监控服务 (间隔)")
-                except Exception as e:
-                    logger.error(f"添加 Interval 任务失败: {str(e)}")
-            
-            # 启动 scheduler (如果添加了任务)
-            if self._scheduler and self._scheduler.get_jobs():
-                try:
-                    self._scheduler.start()
-                    logger.info(f"蜂巢邀请监控服务的 Scheduler 已启动")
-                except Exception as e:
-                    logger.error(f"启动 Scheduler 失败: {str(e)}")
-                    self._scheduler = None # 启动失败则重置
-        else:
-            logger.info("蜂巢邀请监控插件未启用")
-            
+        if not self.config_mgr.enabled:
+            logger.warning("插件配置 disabled，跳过任务调度与定时启动")
+            return
+
+        self.scheduler = BackgroundScheduler(timezone=settings.TZ)
+        # 自动审核
+        try:
+            cron = CronTrigger.from_crontab(self.config_mgr.review_cron)
+            self.scheduler.add_job(self.review_engine.run_review, cron, id="luckpt_review", name="自动审核任务")
+            logger.info("已注册自动审核任务 cron=%s", self.config_mgr.review_cron)
+        except Exception as exc:
+            logger.error("添加自动审核 Cron 失败：%s", exc)
+
+        # 配置同步
+        self.scheduler.add_job(
+            self.review_engine.sync_remote_config,
+            "interval",
+            minutes=self.config_mgr.config_sync_interval,
+            id="luckpt_config_sync",
+            name="审核配置同步",
+        )
+        logger.info("已注册配置同步任务，间隔=%s分钟", self.config_mgr.config_sync_interval)
+        # Cookie 检测
+        self.scheduler.add_job(
+            self.registry.run_cookie_check,
+            "interval",
+            minutes=self.config_mgr.cookie_check_interval,
+            id="luckpt_cookie_check",
+            name="Cookie 有效性检测",
+        )
+        logger.info("已注册Cookie检测任务，间隔=%s分钟", self.config_mgr.cookie_check_interval)
+        # 一次性任务
+        if self.config_mgr.config.get("run_cookie_check_once"):
+            self.scheduler.add_job(
+                self._wrap_once(self.registry.run_cookie_check, "run_cookie_check_once"),
+                "date",
+                run_date=datetime.now() + timedelta(seconds=3),
+                id="luckpt_cookie_once",
+                name="一次性 Cookie 检测",
+            )
+            logger.info("已注册一次性 Cookie 检测任务")
+        if self.config_mgr.config.get("run_parse_check_once"):
+            self.scheduler.add_job(
+                self._wrap_once(self._parse_check_task, "run_parse_check_once"),
+                "date",
+                run_date=datetime.now() + timedelta(seconds=3),
+                id="luckpt_parse_once",
+                name="一次性解析检测",
+            )
+            logger.info("已注册一次性解析检测任务")
+
+        if self.scheduler.get_jobs():
+            self.scheduler.start()
+            logger.info("LuckPT 定时任务启动完成，已注册 %s 个任务", len(self.scheduler.get_jobs()))
+        logger.info("初始化 LuckPTAutoReview 插件结束")
+
+    def stop_service(self):
+        if self.scheduler:
+            try:
+                logger.info("停止 LuckPT 定时任务调度开始")
+                self.scheduler.remove_all_jobs()
+                self.scheduler.shutdown(wait=False)
+                logger.info("停止 LuckPT 定时任务调度完成")
+            except Exception:
+                pass
+            finally:
+                self.scheduler = None
+
     def get_state(self) -> bool:
+        return bool(self.config_mgr and self.config_mgr.enabled)
+
+    # -------------- 任务包装 --------------
+    def _wrap_once(self, func, flag_key: str):
+        def inner():
+            try:
+                func()
+            finally:
+                self.config_mgr.clear_oneoff_flag(flag_key)
+
+        return inner
+
+    def _parse_check_task(self):
+        if not self.registry or not self.parser:
+            return
+        self.registry.refresh()
+        results: List[Dict[str, Any]] = []
+        logger.info("开始解析检测，站点数=%s", len(self.registry.site_mapping))
+
+        def _fetch_with_retry(req: RequestUtils, url: str, attempts: int = 5) -> Optional[Any]:
+            """统一的带重试 GET 请求。"""
+            for idx in range(attempts):
+                res = req.get_res(url, allow_redirects=True, verify=False)
+                if res and res.status_code == 200:
+                    return res
+                time.sleep(1)
+            return None
+
+        def _process_site(key: str, site: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not site.get("local") or not site.get("local", {}).get("cookie"):
+                logger.debug("解析检测跳过：站点=%s 缺少本地配置或 Cookie", key)
+                return None
+            base_url = (site.get("remote") or {}).get("url") or site.get("local", {}).get("url")
+            if not base_url:
+                logger.debug("解析检测跳过：站点=%s 缺少 URL", key)
+                return None
+            try:
+                req = RequestUtils(
+                    headers={"Cookie": site["local"].get("cookie"), "User-Agent": site["local"].get("ua")},
+                    timeout=30,
+                )
+                res = _fetch_with_retry(req, base_url, attempts=5)
+                if not res or res.status_code != 200:
+                    logger.debug(
+                        "解析检测失败：站点=%s HTTP=%s",
+                        key,
+                        res.status_code if res else "无响应",
+                    )
+                    return {
+                        "site_key": key,
+                        "site_name": (site.get("remote") or {}).get("name") or key,
+                        "status": "failed",
+                        "reason": f"访问失败 {res.status_code if res else '无响应'}",
+                        "checked_at": datetime.now().isoformat(),
+                    }
+                parsed = self.parser.parse_page(
+                    res.text,
+                    site_key=key,
+                    overrides={
+                        **self.config_mgr.parse_rule(key),
+                        "level_aliases": self.config_mgr.level_aliases(key),
+                        "base_url": base_url,
+                    },
+                    strip_nav=False,
+                )
+                if (not parsed.get("email") or not parsed.get("level_standard")):
+                    profile_url = parsed.get("profile_url")
+                    if not profile_url:
+                        cookie_str = site.get("local", {}).get("cookie") or ""
+                        m_uid = re.search(r"(?:uid|c_secure_uid)=([0-9]+)", cookie_str, re.IGNORECASE)
+                        if m_uid and base_url:
+                            profile_url = urljoin(base_url, f"/userdetails.php?id={m_uid.group(1)}")
+                    if profile_url:
+                        logger.debug("解析检测二次解析个人主页：站点=%s url=%s", key, profile_url)
+                        res_profile = _fetch_with_retry(req, profile_url, attempts=5)
+                        if res_profile and res_profile.status_code == 200:
+                            parsed_profile = self.parser.parse_page(
+                                res_profile.text,
+                                site_key=key,
+                                overrides={
+                                    **self.config_mgr.parse_rule(key),
+                                    "level_aliases": self.config_mgr.level_aliases(key),
+                                    "base_url": profile_url,
+                                },
+                                strip_nav=False,
+                            )
+                            for k in (
+                                "username",
+                                "email",
+                                "level_raw",
+                                "level_standard",
+                                "level_index",
+                                "privacy_level",
+                                "register_time",
+                            ):
+                                if parsed_profile.get(k):
+                                    parsed[k] = parsed_profile[k]
+                has_username = bool(parsed.get("username"))
+                has_email = bool(parsed.get("email"))
+                has_level = bool(parsed.get("level_standard") or parsed.get("level_raw"))
+                has_standard_level = bool(parsed.get("level_standard"))
+                has_register = bool(parsed.get("register_time"))
+                missing_fields = []
+                if not has_email:
+                    missing_fields.append("邮箱")
+                if not has_level:
+                    missing_fields.append("等级")
+                elif not has_standard_level:
+                    missing_fields.append("标准等级")
+                if not has_register:
+                    missing_fields.append("注册时间")
+                if not has_username:
+                    status_val = "failed"
+                    reason_text = "缺少用户名"
+                elif missing_fields:
+                    status_val = "partial"
+                    reason_text = f"缺少信息：{'/'.join(missing_fields)}"
+                else:
+                    status_val = "success"
+                    reason_text = None
+                logger.debug(
+                    "解析检测完成：站点=%s 状态=%s 用户=%s 邮箱=%s 等级=%s 注册时间=%s",
+                    key,
+                    status_val,
+                    parsed.get("username"),
+                    parsed.get("email"),
+                    parsed.get("level_standard") or parsed.get("level_raw"),
+                    parsed.get("register_time"),
+                )
+                return {
+                    "site_key": key,
+                    "site_name": (site.get("remote") or {}).get("name") or key,
+                    "status": status_val,
+                    "username": parsed.get("username"),
+                    "email": parsed.get("email"),
+                    "level": parsed.get("level_standard") or parsed.get("level_raw"),
+                    "register_time": parsed.get("register_time"),
+                    "checked_at": datetime.now().isoformat(),
+                    "privacy_level": parsed.get("privacy_level"),
+                    "reason": reason_text,
+                }
+            except Exception as exc:
+                logger.error("解析检测异常：站点=%s 错误=%s", key, exc)
+                return {
+                    "site_key": key,
+                    "site_name": (site.get("remote") or {}).get("name") or key,
+                    "status": "failed",
+                    "reason": f"解析异常: {exc}",
+                    "checked_at": datetime.now().isoformat(),
+                }
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_key = {
+                executor.submit(_process_site, key, site): key for key, site in self.registry.site_mapping.items()
+            }
+            for future in as_completed(future_to_key):
+                res = future.result()
+                if res:
+                    results.append(res)
+        self.save_data("parse_check_results", results)
+        success_cnt = len([r for r in results if r.get("status") == "success"])
+        fail_cnt = len([r for r in results if r.get("status") != "success"])
+        logger.info("解析检测结束：成功=%s 失败=%s 总计=%s", success_cnt, fail_cnt, len(results))
+
+    # -------------- UI：配置 --------------
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        if not self.config_mgr:
+            self.config_mgr = ConfigManager(self, None)
+
+        form = [
+            {
+                "component": "VForm",
+                "content": [
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-4", "variant": "tonal"},
+                        "content": [
+                            {"component": "VCardTitle", "text": "基础配置"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {"model": "enabled", "label": "启用插件"},
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "api_base_url",
+                                                            "label": "审核系统基地址",
+                                                            "placeholder": "https://pt.luckpt.de",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "api_proxy",
+                                                            "label": "API 代理（可选）",
+                                                            "placeholder": "http://127.0.0.1:7890",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "api_token",
+                                                            "label": "审核系统 API Token",
+                                                            "type": "password",
+                                                            "placeholder": "必填",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VCronField",
+                                                        "props": {
+                                                            "model": "review_cron",
+                                                            "label": "审核周期 (Cron)",
+                                                            "placeholder": "*/5 * * * *",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-4", "variant": "tonal"},
+                        "content": [
+                            {"component": "VCardTitle", "text": "周期与一次性任务"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "config_sync_interval_minutes",
+                                                            "label": "配置同步间隔(分钟)",
+                                                            "type": "number",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "cookie_check_interval_minutes",
+                                                            "label": "Cookie 检测间隔(分钟)",
+                                                            "type": "number",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "log_refresh_interval_minutes",
+                                                            "label": "审核记录刷新间隔(分钟)",
+                                                            "type": "number",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                    {
+                                        "component": "VRow",
+                                        "class": "mt-2",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "run_cookie_check_once",
+                                                            "label": "运行一次 Cookie 检测",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "run_parse_check_once",
+                                                            "label": "运行一次解析检测",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 4},
+                                                "content": [
+                                                    {}
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 8},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "test_parse_url",
+                                                            "label": "测试解析 URL（保存后自动触发一次解析，仅日志输出）",
+                                                            "placeholder": "https://example.com/userdetails.php?id=123",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-4", "variant": "tonal"},
+                        "content": [
+                            {"component": "VCardTitle", "text": "通知设置"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "notify_review_result",
+                                                            "label": "审核结果通知",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {"model": "notify_exception", "label": "异常通知"},
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {"model": "notify_pending", "label": "待审核提醒"},
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 3},
+                                                "content": [
+                                                    {
+                                                        "component": "VSwitch",
+                                                        "props": {
+                                                            "model": "notify_cookie_invalid",
+                                                            "label": "Cookie 失效通知",
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-4", "variant": "tonal"},
+                        "content": [
+                            {"component": "VCardTitle", "text": "重试策略"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "status_retry_count",
+                                                            "label": "状态更新重试次数",
+                                                            "type": "number",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VTextField",
+                                                        "props": {
+                                                            "model": "status_retry_interval_seconds",
+                                                            "label": "状态更新重试间隔(秒)",
+                                                            "type": "number",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "保存后自动启动任务。Token 仅用于调用审核 API，不会记录完整明文。",
+                        },
+                    },
+                ],
+            }
+        ]
+        return form, self.config_mgr.config
+
+    # -------------- UI：展示页 --------------
+    def get_page(self) -> List[dict]:
+        if self.review_engine and self.config_mgr and self.config_mgr.api_token:
+            try:
+                self.review_engine.fetch_logs()
+            except Exception as exc:
+                logger.warning("页面加载时拉取审核日志失败：%s", exc)
+        logs = self.get_data("review_logs") or []
+        stats = self.get_data("review_health_stats") or {}
+        cookie_status = self.get_data("cookie_status") or {}
+        parse_results = self.get_data("parse_check_results") or []
+        pending_apps = self._fetch_applications(auto_status="none")
+
+        def _fmt_time(value: Any) -> str:
+            """Format time string to seconds if present."""
+            if not value:
+                return "-"
+            return str(value)[:19]
+
+        def _log_style(action: str, to_status: Optional[str]) -> Tuple[str, str]:
+            act = (action or "").lower()
+            status = (to_status or "").lower()
+            if act == "status_change":
+                if status in ("approved", "passed"):
+                    return "mdi-check-circle-outline", "success"
+                if status in ("rejected", "failed"):
+                    return "mdi-close-circle-outline", "error"
+                return "mdi-transition", "primary"
+            if "lock" in act:
+                return "mdi-lock-outline", "info"
+            if "unlock" in act:
+                return "mdi-lock-open-variant-outline", "warning"
+            return "mdi-note-text-outline", "grey"
+
+        log_timeline_items = []
+        for item in logs:
+            icon, color = _log_style(item.get("action"), item.get("to_status"))
+            payload = item.get("payload") or {}
+            remark = payload.get("remark") or json.dumps(payload, ensure_ascii=False)
+            log_timeline_items.append(
+                {
+                    "component": "VTimelineItem",
+                    "props": {"dot-color": color, "icon": icon, "size": "small", "elevation": 2},
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption text-medium-emphasis"},
+                            "text": f"{_fmt_time(item.get('created_at'))} · 申请 {item.get('application_id')}",
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "font-weight-medium"},
+                            "text": f"{item.get('action') or '-'} → {item.get('to_status') or '-'}",
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "text-body-2 mt-1"},
+                            "text": remark,
+                        },
+                    ],
+                }
+            )
+        if not log_timeline_items:
+            log_timeline_items = [{"component": "div", "text": "暂无数据"}]
+
+        last_config_synced = _fmt_time(self.config_mgr.remote_config_ts if self.config_mgr else None)
+        last_log_ts = _fmt_time(max([l.get("created_at") for l in logs], default=None))
+        remote_site_count = len(self.config_mgr.remote_sites) if self.config_mgr and self.config_mgr.remote_sites else 0
+        config_base_url = self.config_mgr.api_base if self.config_mgr else "-"
+        verification_level = self.config_mgr.verification_level if self.config_mgr else "-"
+
+        remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
+        # 如果本地未缓存站点且有 token，强制拉取一次 config
+        if not remote_sites and self.review_engine and self.config_mgr and self.config_mgr.api_token:
+            self.review_engine.sync_remote_config()
+            remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
+        all_site_keys = {s.get("key") or s.get("site_key") for s in remote_sites if s.get("key") or s.get("site_key")}
+        all_site_keys.update(cookie_status.keys())
+        all_site_keys.update([p.get("site_key") for p in parse_results if p.get("site_key")])
+
+        # --- 构造 Cookie 卡片数据 ---
+        cookie_cards: List[Dict[str, Any]] = []
+        for key in sorted(all_site_keys):
+            remote = next((s for s in remote_sites if (s.get("key") or s.get("site_key")) == key), {})
+            status = cookie_status.get(key, {})
+            matched = status.get("matched", False)
+            valid = status.get("valid", None)
+            if not matched and status:
+                state = "未匹配"
+                color = "grey"
+            elif valid is True:
+                state = "正常"
+                color = "success"
+            elif valid is False:
+                state = "失效"
+                color = "error"
+            else:
+                state = "未检测"
+                color = "info"
+            cookie_cards.append(
+                {
+                    "site_name": remote.get("name") or key,
+                    "site_key": key,
+                    "state": state,
+                    "color": color,
+                    "matched": matched,
+                    "valid": valid,
+                    "reason": status.get("reason", ""),
+                    "checked_at": status.get("checked_at", ""),
+                }
+            )
+        cookie_grouped = {
+            "正常": [c for c in cookie_cards if c["state"] == "正常"],
+            "失效": [c for c in cookie_cards if c["state"] == "失效"],
+            "未匹配": [c for c in cookie_cards if c["state"] == "未匹配"],
+            "未检测": [c for c in cookie_cards if c["state"] == "未检测"],
+        }
+
+        # --- 构造解析卡片数据 ---
+        parse_cards: List[Dict[str, Any]] = []
+        parse_map = {item.get("site_key"): item for item in parse_results if item.get("site_key")}
+        for key in sorted(all_site_keys):
+            remote = next((s for s in remote_sites if (s.get("key") or s.get("site_key")) == key), {})
+            res = parse_map.get(key, {})
+            status_text = res.get("status")
+            if status_text == "success":
+                state = "成功"
+                color = "success"
+            elif status_text == "partial":
+                state = "存疑"
+                color = "warning"
+            elif status_text == "failed":
+                state = "失败"
+                color = "error"
+            else:
+                state = "未检测"
+                color = "grey"
+            parse_cards.append(
+                {
+                    "site_name": remote.get("name") or key,
+                    "site_key": key,
+                    "state": state,
+                    "color": color,
+                    "username": res.get("username"),
+                    "email": res.get("email"),
+                    "level": res.get("level"),
+                    "register_time": res.get("register_time"),
+                    "privacy": res.get("privacy_level"),
+                    "reason": res.get("reason", ""),
+                    "checked_at": res.get("checked_at", ""),
+                }
+            )
+        parse_grouped = {
+            "成功": [p for p in parse_cards if p["state"] == "成功"],
+            "存疑": [p for p in parse_cards if p["state"] == "存疑"],
+            "失败": [p for p in parse_cards if p["state"] == "失败"],
+            "未检测": [p for p in parse_cards if p["state"] == "未检测"],
+        }
+
+        # 构造分组卡片（避免前端解析问题，用显式列表）
+        cookie_panels: List[Dict[str, Any]] = []
+        for group, items in cookie_grouped.items():
+            cols = [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"class": "mb-3", "color": item.get("color"), "variant": "tonal"},
+                            "content": [
+                                {
+                                    "component": "VCardTitle",
+                                    "props": {"class": "d-flex justify-space-between align-center"},
+                                    "content": [
+                                        {"component": "span", "text": item.get("site_name")},
+                                        {"component": "VChip", "props": {"color": item.get("color"), "size": "small", "variant": "flat"}, "text": item.get("state")},
+                                    ],
+                                },
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {"component": "div", "text": f"匹配：{item.get('matched')}"},
+                                        {"component": "div", "text": f"有效：{item.get('valid')}"},
+                                        {"component": "div", "text": f"原因：{item.get('reason') or '无'}"},
+                                        {"component": "div", "text": f"时间：{_fmt_time(item.get('checked_at'))}"},
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+                for item in items
+            ]
+            if not cols:
+                cols = [{"component": "div", "text": "暂无数据"}]
+            cookie_panels.append(
+                {
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": f"{group}（{len(items)}）"},
+                        {"component": "VExpansionPanelText", "content": [{"component": "VRow", "content": cols}]},
+                    ],
+                }
+            )
+
+        parse_panels: List[Dict[str, Any]] = []
+        for group, items in parse_grouped.items():
+            cols = [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"class": "mb-3", "color": item.get("color"), "variant": "tonal"},
+                            "content": [
+                                {"component": "VCardTitle", "props": {"class": "d-flex justify-space-between align-center"}, "content": [
+                                    {"component": "span", "text": item.get("site_name")},
+                                    {"component": "VChip", "props": {"color": item.get("color"), "size": "small", "variant": "flat"}, "text": item.get("state")},
+                                ]},
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {"component": "div", "text": f"用户名：{item.get('username') or '-'}"},
+                                        {"component": "div", "text": f"邮箱：{item.get('email') or '-'}"},
+                                        {"component": "div", "text": f"等级：{item.get('level') or '-'}"},
+                                        {"component": "div", "text": f"注册：{item.get('register_time') or '-'}"},
+                                        {"component": "div", "text": f"隐私：{item.get('privacy') or '-'}"},
+                                        {"component": "div", "text": f"原因：{item.get('reason') or '无'}"},
+                                        {"component": "div", "text": f"时间：{_fmt_time(item.get('checked_at'))}"},
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+                for item in items
+            ]
+            if not cols:
+                cols = [{"component": "div", "text": "暂无数据"}]
+            parse_panels.append(
+                {
+                    "component": "VExpansionPanel",
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": f"{group}（{len(items)}）"},
+                        {"component": "VExpansionPanelText", "content": [{"component": "VRow", "content": cols}]},
+                    ],
+                }
+            )
+
+        approve_cnt = int(stats.get("approve", 0))
+        reject_cnt = int(stats.get("reject", 0))
+        failed_cnt = int(stats.get("failed", 0))
+        skipped_cnt = int(stats.get("skipped_no_cookie", 0))
+        cookie_valid_cnt = len([c for c in cookie_cards if c["state"] == "正常"])
+        cookie_invalid_cnt = len([c for c in cookie_cards if c["state"] == "失效"])
+        parse_success_cnt = len([p for p in parse_cards if p["state"] == "成功"])
+        parse_fail_cnt = len([p for p in parse_cards if p["state"] == "失败"])
+        total_cnt = approve_cnt + reject_cnt + failed_cnt + skipped_cnt or 1
+        approve_ratio = int(approve_cnt / total_cnt * 100)
+        reject_ratio = int(reject_cnt / total_cnt * 100)
+        failed_ratio = int(failed_cnt / total_cnt * 100)
+        skipped_ratio = int(skipped_cnt / total_cnt * 100)
+        cookie_processed = cookie_valid_cnt + cookie_invalid_cnt
+        cookie_ratio = int(cookie_valid_cnt / (cookie_processed or 1) * 100)
+        parse_processed = parse_success_cnt + parse_fail_cnt
+        parse_ratio = int(parse_success_cnt / (parse_processed or 1) * 100)
+        cookie_chart_color = "success" if cookie_processed else "grey"
+        parse_chart_color = "info" if parse_processed else "grey"
+        cookie_ratio_display = f"{cookie_ratio}%" if cookie_processed else "未检测"
+        parse_ratio_display = f"{parse_ratio}%" if parse_processed else "未检测"
+
+        pending_cards = [
+            {
+                "component": "VCol",
+                "props": {"cols": 12, "sm": 6, "md": 3, "lg": 3},
+                "content": [
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-3", "variant": "tonal"},
+                        "content": [
+                            {"component": "VCardTitle", "text": f"申请 {item.get('id')}"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {"component": "div", "text": f"类型：{item.get('type')}"},
+                                    {"component": "div", "text": f"状态：{item.get('status')} / {item.get('auto_status')}"},
+                                    {"component": "div", "text": f"邮箱：{item.get('target_email')}"},
+                                    {"component": "div", "text": f"用户名：{item.get('target_username')}"},
+                                    {"component": "div", "text": f"创建：{_fmt_time(item.get('created_at'))}"},
+                                    {"component": "div", "text": f"更新：{_fmt_time(item.get('updated_at'))}"},
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+            for item in pending_apps
+        ] or [{"component": "div", "text": "暂无数据"}]
+
+        # 健康统计卡片（固定展示，图形化+更多信息）
+        health_card = {
+            "component": "VCard",
+            "props": {"variant": "tonal", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "text": "健康统计"},
+                {
+                    "component": "VCardText",
+                    "content": [
+                        {
+                            "component": "VRow",
+                            "content": [
+                                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1", "color": "success", "variant": "tonal"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption"}, "text": "自动通过"},
+                                        {"component": "div", "props": {"class": "text-h5 font-weight-bold"}, "text": approve_cnt},
+                                    ]}
+                                ]},
+                                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1", "color": "warning", "variant": "tonal"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption"}, "text": "自动拒绝"},
+                                        {"component": "div", "props": {"class": "text-h5 font-weight-bold"}, "text": reject_cnt},
+                                    ]}
+                                ]},
+                                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1", "color": "error", "variant": "tonal"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption"}, "text": "审核失败"},
+                                        {"component": "div", "props": {"class": "text-h5 font-weight-bold"}, "text": failed_cnt},
+                                    ]}
+                                ]},
+                                {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1", "color": "info", "variant": "tonal"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption"}, "text": "缺 Cookie 跳过"},
+                                        {"component": "div", "props": {"class": "text-h5 font-weight-bold"}, "text": skipped_cnt},
+                                    ]}
+                                ]},
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "props": {"class": "mt-2"},
+                            "content": [
+                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                    {"component": "div", "props": {"class": "mb-1 text-caption text-medium-emphasis"}, "text": "状态占比"},
+                                    {"component": "div", "props": {"class": "d-flex flex-wrap gap-6 align-center"}, "content": [
+                                        {"component": "div", "props": {"class": "d-flex flex-column align-center", "style": "width: 96px;"}, "content": [
+                                            {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": "success", "model-value": approve_ratio}, "content": [{"component": "div", "props": {"class": "text-subtitle-2"}, "text": f"{approve_ratio}%"}]},
+                                            {"component": "div", "props": {"class": "text-caption mt-1"}, "text": "通过"},
+                                        ]},
+                                        {"component": "div", "props": {"class": "d-flex flex-column align-center", "style": "width: 96px;"}, "content": [
+                                            {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": "warning", "model-value": reject_ratio}, "content": [{"component": "div", "props": {"class": "text-subtitle-2"}, "text": f"{reject_ratio}%"}]},
+                                            {"component": "div", "props": {"class": "text-caption mt-1"}, "text": "拒绝"},
+                                        ]},
+                                        {"component": "div", "props": {"class": "d-flex flex-column align-center", "style": "width: 96px;"}, "content": [
+                                            {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": "error", "model-value": failed_ratio}, "content": [{"component": "div", "props": {"class": "text-subtitle-2"}, "text": f"{failed_ratio}%"}]},
+                                            {"component": "div", "props": {"class": "text-caption mt-1"}, "text": "失败"},
+                                        ]},
+                                        {"component": "div", "props": {"class": "d-flex flex-column align-center", "style": "width: 96px;"}, "content": [
+                                            {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": "info", "model-value": skipped_ratio}, "content": [{"component": "div", "props": {"class": "text-subtitle-2"}, "text": f"{skipped_ratio}%"}]},
+                                            {"component": "div", "props": {"class": "text-caption mt-1"}, "text": "跳过"},
+                                        ]},
+                                    ]},
+                                    {"component": "div", "props": {"class": "d-flex justify-space-between mt-1 text-caption"}, "content": [
+                                        {"component": "span", "text": f"通过 {approve_cnt}"},
+                                        {"component": "span", "text": f"拒绝 {reject_cnt}"},
+                                        {"component": "span", "text": f"失败 {failed_cnt}"},
+                                        {"component": "span", "text": f"跳过 {skipped_cnt}"},
+                                    ]},
+                                ]},
+                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                    {"component": "div", "props": {"class": "mb-1 text-caption text-medium-emphasis"}, "text": "配置与时间"},
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1", "color": "primary", "variant": "tonal"}, "content": [
+                                        {"component": "div", "text": f"API 地址：{config_base_url}"},
+                                        {"component": "div", "text": f"站点配置数：{remote_site_count}"},
+                                        {"component": "div", "text": f"验证等级：{verification_level}"},
+                                        {"component": "div", "text": f"最后配置同步：{last_config_synced}"},
+                                        {"component": "div", "text": f"最后审核时间：{last_log_ts}"},
+                                    ]},
+                                ]},
+                            ],
+                        },
+                        {
+                            "component": "VRow",
+                            "props": {"class": "mt-2"},
+                            "content": [
+                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1 bg-grey-lighten-4", "variant": "flat"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption text-high-emphasis"}, "text": "Cookie 正常率（已检测）"},
+                                        {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": cookie_chart_color, "model-value": cookie_ratio}, "content": [
+                                            {"component": "div", "props": {"class": "text-subtitle-2"}, "text": cookie_ratio_display},
+                                        ]},
+                                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"正常 {cookie_valid_cnt} / 失效 {cookie_invalid_cnt} / 已检测 {cookie_processed} / 总 {len(cookie_cards)}"},
+                                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "比例按已检测（正常+失效）计算，未检测未参与比例"},
+                                    ]},
+                                ]},
+                                {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                                    {"component": "VSheet", "props": {"class": "pa-3 rounded-lg elevation-1 bg-grey-lighten-4", "variant": "flat"}, "content": [
+                                        {"component": "div", "props": {"class": "text-caption text-high-emphasis"}, "text": "解析成功率（已检测）"},
+                                        {"component": "VProgressCircular", "props": {"size": 72, "width": 8, "color": parse_chart_color, "model-value": parse_ratio}, "content": [
+                                            {"component": "div", "props": {"class": "text-subtitle-2"}, "text": parse_ratio_display},
+                                        ]},
+                                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"成功 {parse_success_cnt} / 失败 {parse_fail_cnt} / 已检测 {parse_processed} / 总 {len(parse_cards)}"},
+                                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "比例按已检测（成功+失败）计算，未检测未参与比例"},
+                                    ]},
+                                ]},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+
+        accordion = {
+            "component": "VExpansionPanels",
+            "props": {"multiple": False, "variant": "accordion", "model": "luckpt_panels_secondary", "modelValue": ["日志"]},
+            "content": [
+                {
+                    "component": "VExpansionPanel",
+                    "props": {"value": "日志"},
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": "审核日志"},
+                        {"component": "VExpansionPanelText", "content": [
+                            {"component": "VTimeline", "props": {"truncate-line": "both", "density": "compact"}, "content": log_timeline_items},
+                        ]},
+                    ],
+                },
+                {
+                    "component": "VExpansionPanel",
+                    "props": {"value": "待审核"},
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": "待审核列表"},
+                        {"component": "VExpansionPanelText", "content": [
+                            {"component": "VRow", "content": pending_cards},
+                        ]},
+                    ],
+                },
+                {
+                    "component": "VExpansionPanel",
+                    "props": {"value": "Cookie"},
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": "Cookie 匹配与有效性"},
+                        {"component": "VExpansionPanelText", "content": [
+                            {"component": "VExpansionPanels", "props": {"variant": "accordion", "multiple": True}, "content": cookie_panels}
+                        ]},
+                    ],
+                },
+                {
+                    "component": "VExpansionPanel",
+                    "props": {"value": "解析"},
+                    "content": [
+                        {"component": "VExpansionPanelTitle", "text": "解析检测结果"},
+                        {"component": "VExpansionPanelText", "content": [
+                            {"component": "VExpansionPanels", "props": {"variant": "accordion", "multiple": True}, "content": parse_panels}
+                        ]},
+                    ],
+                },
+            ],
+        }
+
+        return [health_card, accordion]
+
+    def _fetch_applications(self, auto_status: Optional[str] = None) -> List[Dict[str, Any]]:
         """
-        获取插件状态
+        仅用于页面展示时拉取数据。
         """
-        return self._enabled
-    
-    @staticmethod
-    def get_command() -> List[Dict[str, Any]]:
-        """
-        注册命令
-        """
+        if not self.config_mgr or not self.config_mgr.api_token:
+            return []
+        query = {"page": 1, "per_page": 50}
+        if auto_status:
+            query["auto_status"] = auto_status
+            logger.debug("页面拉取申请列表，auto_status=%s", auto_status)
+        url = self.config_mgr.api_base.rstrip("/") + "/api/v1/site-verifications"
+        headers = {"Authorization": f"Bearer {self.config_mgr.api_token}", "Content-Type": "application/json"}
+        proxies = self.config_mgr.api_proxies
+        for attempt in range(3):
+            try:
+                res = RequestUtils(headers=headers, timeout=15, proxies=proxies).get_res(url, params=query)
+                if res and res.status_code == 200:
+                    payload = res.json()
+                    if str(payload.get("ret")) == "0":
+                        data_list = payload.get("data", {}).get("data") or []
+                        if attempt > 0:
+                            logger.info("页面申请列表重试成功，第%s次", attempt + 1)
+                        logger.debug("页面拉取申请列表成功，数量=%s", len(data_list))
+                        return data_list
+                    logger.warning("页面申请列表响应 ret!=0 #%s：%s", attempt + 1, payload.get("msg"))
+                else:
+                    logger.warning("页面申请列表 HTTP 失败 #%s：%s", attempt + 1, res.status_code if res else "无响应")
+            except Exception as exc:
+                logger.warning("页面申请列表请求异常 #%s：%s", attempt + 1, exc)
+            if attempt < 2:
+                time.sleep(1)
+        return []
+
+    # -------------- 命令 / API --------------
+    def get_command(self) -> List[Dict[str, Any]]:
         return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """
-        注册API
-        """
         return []
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """
-        注册服务 (如果需要对外提供)
-        """
-        return [] 
-    
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """
-        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
-        """
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'enabled',
-                                            'label': '启用插件',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'notify',
-                                            'label': '开启通知',
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 4
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'onlyonce',
-                                            'label': '立即运行一次',
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # 用户名密码输入
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'username',
-                                            'label': '用户名',
-                                            'placeholder': '蜂巢论坛用户名',
-                                            'hint': '请输入蜂巢论坛用户名'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'password',
-                                            'label': '密码',
-                                            'placeholder': '蜂巢论坛密码',
-                                            'type': 'password',
-                                            'hint': '请输入蜂巢论坛密码'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # 监控周期和重试设置
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VCronField',
-                                        'props': {
-                                            'model': 'cron',
-                                            'label': '定时周期',
-                                            'placeholder': '*/5 * * * *',
-                                            'hint': '填写cron表达式，留空则使用固定间隔'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'check_interval',
-                                            'label': '固定间隔(分钟)',
-                                            'placeholder': '5',
-                                            'hint': '未配置cron表达式时使用，每隔多少分钟检查一次'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # 失败重试设置
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'retry_count',
-                                            'label': '失败重试次数',
-                                            'type': 'number',
-                                            'placeholder': '3',
-                                            'hint': '请求失败重试次数'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'retry_interval',
-                                            'label': '重试间隔(秒)',
-                                            'type': 'number',
-                                            'placeholder': '5',
-                                            'hint': '请求失败多少秒后重试'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # 代理设置
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'use_proxy',
-                                            'label': '使用代理',
-                                            'hint': '与蜂巢论坛通信时使用系统代理'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # --- 新增：自动审核开关 ---
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 6
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'auto_approve_enabled',
-                                            'label': '启用自动审核通过',
-                                            'hint': '当内部验证通过且等级不是VIP时，自动调用API通过审核'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    # --- 新增结束 ---
-                    # 提示
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12},
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'info',
-                                            'variant': 'tonal',
-                                            'text': '此插件用于监控蜂巢论坛的邀请审核状态，当有新的待审核邀请或邀请长时间未审核时，将通过MoviePilot通知系统推送信息。'
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ], {
-            "enabled": False,
-            "notify": True,
-            "cron": "*/5 * * * *",
-            "onlyonce": False,
-            "username": "",
-            "password": "",
-            "check_interval": 5,
-            "retry_count": 3,
-            "retry_interval": 5,
-            "use_proxy": True,
-            "auto_approve_enabled": False # 新增默认值
-        }
-
-    def get_page(self) -> List[dict]:
-        """
-        构建插件详情页面，展示待审核邀请的详细信息及初步判断
-        """
-        invite_details = self.get_data('pending_invites_details') or {}
-        
-        if not invite_details:
-            return [
-                {
-                    'component': 'VAlert',
-                    'props': {
-                        'type': 'info',
-                        'variant': 'tonal',
-                        'text': '当前没有待审核的邀请记录。',
-                        'class': 'mb-2',
-                        'prepend-icon': 'mdi-information-outline'
-                    }
-                }
-            ]
-        
-        invite_list = []
-        for item_id, details in invite_details.items():
-            details['id'] = item_id
-            invite_list.append(details)
-            
-        try:
-             invite_list.sort(key=lambda x: x.get('timestamp', '0'), reverse=True)
-        except Exception as e:
-            logger.error(f"邀请列表排序失败: {e}")
-
-        invite_cards = []
-        for invite in invite_list:
-            item_id = invite.get('id', 'N/A')
-            timestamp_str = invite.get('timestamp', '')
-            # --- 从存储的数据中获取信息 --- 
-            inviter = invite.get('inviter', '未知') # 邀请人
-            invitee_email_api = invite.get('invitee_email_api', '未知')
-            invitee_username_api = invite.get('invitee_username_api', '未知')
-            link1 = invite.get('link1', '')
-            link2 = invite.get('link2', '')
-            is_main_account = invite.get('is_main_account', False)
-            link1_extracted_username = invite.get('link1_extracted_username')
-            link1_extracted_email = invite.get('link1_extracted_email')
-            link1_extracted_level = invite.get('link1_extracted_level')
-            link1_status = invite.get('link1_status', {})
-            link2_extracted_username = invite.get('link2_extracted_username')
-            link2_extracted_email = invite.get('link2_extracted_email')
-            link2_extracted_level = invite.get('link2_extracted_level')
-            link2_status = invite.get('link2_status', {})
-            final_pass = invite.get('final_pass_status', False) # 获取最终判断结果
-            
-            # --- 根据最终判断结果确定状态和颜色 ---
-            judgment_status = "通过" if final_pass else "不通过"
-            status_color = "success" if final_pass else "error"
-            
-            # --- 构建判断原因 --- 
-            reasons = []
-            if link1:
-                l1_reason = "链接1: "
-                if link1_status.get('error'):
-                    l1_reason += f"验证失败 ({link1_status['error']})"
-                elif link1_status.get('verified'):
-                    l1_reason += "✅ 通过"
-                else:
-                    l1_fail_reasons = []
-                    if not link1_status.get('username_match'): l1_fail_reasons.append("用户名不匹配")
-                    if not link1_status.get('email_match'): l1_fail_reasons.append("邮箱不匹配")
-                    if not link1_status.get('level_ok'): l1_fail_reasons.append("等级不符")
-                    l1_reason += f"❌ 不通过 ({ ', '.join(l1_fail_reasons) if l1_fail_reasons else '未知原因' })"
-                reasons.append(l1_reason)
-            if link2:
-                l2_reason = "链接2: "
-                if link2_status.get('error'):
-                    l2_reason += f"验证失败 ({link2_status['error']})"
-                elif link2_status.get('verified'):
-                    l2_reason += "✅ 通过"
-                else:
-                    l2_fail_reasons = []
-                    if not link2_status.get('username_match'): l2_fail_reasons.append("用户名不匹配")
-                    if not link2_status.get('email_match'): l2_fail_reasons.append("邮箱不匹配")
-                    if not link2_status.get('level_ok'): l2_fail_reasons.append("等级不符")
-                    l2_reason += f"❌ 不通过 ({ ', '.join(l2_fail_reasons) if l2_fail_reasons else '未知原因' })"
-                reasons.append(l2_reason)
-            
-            if not link1 and not link2:
-                 reasons.append("未提供验证链接")
-                 status_color = "grey"
-                 judgment_status = "无法验证"
-                 
-            judgment_reason = " | ".join(reasons)
-             
-            # --- 格式化时间戳和计算持续时间 (代码不变) --- 
-            display_time = timestamp_str
-            duration_str = "未知"
-            duration_color = "grey"
-            duration_icon = "mdi-help-circle"
-            if timestamp_str:
-                try:
-                    dt_obj = datetime.fromisoformat(timestamp_str)
-                    display_time = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
-                    duration = datetime.now(dt_obj.tzinfo) - dt_obj
-                    days, remainder = divmod(duration.total_seconds(), 86400)
-                    hours, remainder = divmod(remainder, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    duration_str = f"{int(days)}天 {int(hours)}小时 {int(minutes)}分"
-                    # 根据等待时间调整颜色，但优先使用判断结果的颜色
-                    base_duration_color = "error" if duration.total_seconds() > 4 * 3600 else "warning" if duration.total_seconds() > 2 * 3600 else "info"
-                    base_duration_icon = "mdi-alert-circle" if base_duration_color == "error" else "mdi-clock-alert-outline" if base_duration_color == "warning" else "mdi-timer-sand"
-                except ValueError:
-                    display_time = "时间格式错误"
-            else:
-                display_time = "无时间记录"
-
-            invite_cards.append({
-                'component': 'VCard',
-                'props': {'class': 'mb-3 elevation-1', 'variant': 'outlined'},
-                'content': [
-                    {
-                        'component': 'VCardTitle',
-                        'props': {'class': 'd-flex align-center py-2', 'style': f'background-color: rgba(var(--v-theme-{status_color}), 0.1); border-bottom: 1px solid rgba(0,0,0,0.1);'},
-                        'content': [
-                            {
-                                'component': 'VIcon',
-                                'props': {'color': status_color, 'class': 'mr-2'},
-                                'text': 'mdi-email-fast-outline'
-                            },
-                            {
-                                'component': 'span',
-                                'props': {'class': 'text-body-1 font-weight-medium'},
-                                'text': f'待审核邀请 (ID: {item_id})'
-                            },
-                            # --- 新增：主账号标识 --- 
-                            {
-                                'component': 'VChip',
-                                'props': {
-                                    'color': 'primary', # 主账号用醒目颜色
-                                    'size': 'x-small',
-                                    'class': 'ml-2',
-                                    'variant': 'flat',
-                                    'prepend-icon': 'mdi-account-check'
-                                },
-                                'text': '主账号邀请'
-                            } if is_main_account else {},
-                            # --- 新增结束 ---
-                            {
-                                'component': 'VSpacer'
-                            },
-                            # --- 修改: 显示最终判断状态 Chip --- 
-                            {
-                                'component': 'VChip',
-                                'props': {
-                                    'color': status_color,
-                                    'size': 'small',
-                                    'variant': 'flat', # 实心更好看
-                                    'prepend-icon': 'mdi-check-decagram' if status_color == 'success' else 'mdi-alert-decagram' if status_color == 'error' else 'mdi-help-circle-outline'
-                                },
-                                'text': judgment_status # 直接显示判断状态
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCardText',
-                        'props': {'class': 'pa-3'},
-                        'content': [
-                            # --- 添加: 判断依据 --- 
-                            {
-                                'component': 'div',
-                                'props': {'class': f'd-flex align-start mb-2 pa-2 rounded text-caption text-{status_color}', 'style': f'background-color: rgba(var(--v-theme-{status_color}), 0.05); border: 1px solid rgba(var(--v-theme-{status_color}), 0.2);'},
-                                'content': [
-                                    {
-                                        'component': 'VIcon',
-                                        'props': {'size': 'small', 'class': 'mr-2', 'style': f'color: {status_color}; margin-top: 1px;'},
-                                        'text': 'mdi-information-outline'
-                                    },
-                                    {
-                                        'component': 'span',
-                                        'text': judgment_reason
-                                    }
-                                ]
-                            },
-                            # 邀请人
-                            {
-                                'component': 'div',
-                                'props': {'class': 'd-flex align-center mb-2'},
-                                'content': [
-                                    {'component': 'VIcon', 'props': {'size': 'small', 'color': 'blue-grey-darken-1', 'class': 'mr-2'}, 'text': 'mdi-account-arrow-right'},
-                                    {'component': 'span', 'props': {'class': 'font-weight-bold mr-2', 'style': 'min-width: 100px;'}, 'text': '邀请人:'},
-                                    {'component': 'span', 'text': inviter}
-                                ]
-                            },
-                            # 受邀人用户名 (来自 API)
-                            {
-                                'component': 'div',
-                                'props': {'class': 'd-flex align-center mb-2'},
-                                'content': [
-                                    {'component': 'VIcon', 'props': {'size': 'small', 'color': 'blue-grey-darken-1', 'class': 'mr-2'}, 'text': 'mdi-account'},
-                                    {'component': 'span', 'props': {'class': 'font-weight-bold mr-2', 'style': 'min-width: 100px;'}, 'text': '受邀人用户名(API):'},
-                                    {'component': 'span', 'text': invitee_username_api}
-                                ]
-                            },
-                            # 受邀人邮箱 (来自 API)
-                            {
-                                'component': 'div',
-                                'props': {'class': 'd-flex align-center mb-2'},
-                                'content': [
-                                    {'component': 'VIcon', 'props': {'size': 'small', 'color': 'blue-grey-darken-1', 'class': 'mr-2'}, 'text': 'mdi-email'},
-                                    {'component': 'span', 'props': {'class': 'font-weight-bold mr-2', 'style': 'min-width: 100px;'}, 'text': '受邀人邮箱(API):'},
-                                    {'component': 'span', 'text': invitee_email_api}
-                                ]
-                            },
-                            # --- 链接1 验证详情 --- 
-                            {
-                                'component': 'VExpansionPanels',
-                                'props': {'variant': 'accordion', 'class': 'mt-2 mb-1', 'style': 'font-size: 0.8rem;'},
-                                'content': [
-                                    {
-                                        'component': 'VExpansionPanel',
-                                        'content': [
-                                            {
-                                                'component': 'VExpansionPanelTitle',
-                                                'props': {'class': 'pa-2', 'style': 'min-height: 36px;'},
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {'class': 'd-flex align-center w-100'},
-                                                        'content': [
-                                                            {'component': 'VIcon', 'props': {'size': 'small', 'class': 'mr-1', 'color': 'link1_verified' if link1_status.get('verified') else ('error' if link1_status.get('error') else 'grey')}, 'text': 'mdi-link-variant'},
-                                                            {'component': 'span', 'props': {'class': 'text-caption font-weight-medium'}, 'text': '链接1验证'},
-                                                            {'component': 'VSpacer'},
-                                                            {'component': 'VChip', 'props': {'size': 'x-small', 'color': 'success' if link1_status.get('verified') else ('error' if not link1_status.get('error') else 'grey'), 'variant': 'flat'}, 'text': '通过' if link1_status.get('verified') else ('失败' if link1_status.get('error') else '不通过')}
-                                                        ]
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VExpansionPanelText',
-                                                'props': {'class': 'pa-2 text-caption'},
-                                                'content': [
-                                                    # 使用 VBtn 或 a 标签使链接可点击
-                                                    {
-                                                        'component': 'div', 
-                                                        'content': [
-                                                            {'component': 'span', 'text': '链接: ', 'props': {'class': 'mr-1'}},
-                                                            {
-                                                                'component': 'a', 
-                                                                'props': {'href': link1, 'target': '_blank', 'style': 'word-break: break-all;'}, 
-                                                                'text': link1 or '无'
-                                                            }
-                                                        ]
-                                                    } if link1 else {'component': 'div', 'text': '链接: 无'},
-                                                    {'component': 'div', 'text': f"验证状态: {link1_status.get('error') or ('通过' if link1_status.get('verified') else '不通过')}"},
-                                                    {'component': 'div', 'text': f"提取用户: {link1_extracted_username or 'N/A'} ({ '✅匹配' if link1_status.get('username_match') else '❌不符' })"},
-                                                    {'component': 'div', 'text': f"提取邮箱: {link1_extracted_email or 'N/A'} ({ '✅匹配' if link1_status.get('email_match') else '❌不符' })"},
-                                                    {'component': 'div', 'text': f"提取等级: {link1_extracted_level or 'N/A'} ({ '✅通过' if link1_status.get('level_ok') else '❌不符' })"}
-                                                ]
-                                            }
-                                        ]
-                                    } if link1 else {},
-                                    {
-                                        'component': 'VExpansionPanel',
-                                        'content': [
-                                            {
-                                                'component': 'VExpansionPanelTitle',
-                                                'props': {'class': 'pa-2', 'style': 'min-height: 36px;'},
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {'class': 'd-flex align-center w-100'},
-                                                        'content': [
-                                                            {'component': 'VIcon', 'props': {'size': 'small', 'class': 'mr-1', 'color': 'link2_verified' if link2_status.get('verified') else ('error' if link2_status.get('error') else 'grey')}, 'text': 'mdi-link-variant'},
-                                                            {'component': 'span', 'props': {'class': 'text-caption font-weight-medium'}, 'text': '链接2验证'},
-                                                            {'component': 'VSpacer'},
-                                                            {'component': 'VChip', 'props': {'size': 'x-small', 'color': 'success' if link2_status.get('verified') else ('error' if not link2_status.get('error') else 'grey'), 'variant': 'flat'}, 'text': '通过' if link2_status.get('verified') else ('失败' if link2_status.get('error') else '不通过')}
-                                                        ]
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VExpansionPanelText',
-                                                'props': {'class': 'pa-2 text-caption'},
-                                                'content': [
-                                                    # 使用 VBtn 或 a 标签使链接可点击
-                                                    {
-                                                        'component': 'div', 
-                                                        'content': [
-                                                            {'component': 'span', 'text': '链接: ', 'props': {'class': 'mr-1'}},
-                                                            {
-                                                                'component': 'a', 
-                                                                'props': {'href': link2, 'target': '_blank', 'style': 'word-break: break-all;'}, 
-                                                                'text': link2 or '无'
-                                                            }
-                                                        ]
-                                                    } if link2 else {'component': 'div', 'text': '链接: 无'},
-                                                    {'component': 'div', 'text': f"验证状态: {link2_status.get('error') or ('通过' if link2_status.get('verified') else '不通过')}"},
-                                                    {'component': 'div', 'text': f"提取用户: {link2_extracted_username or 'N/A'} ({ '✅匹配' if link2_status.get('username_match') else '❌不符' })"},
-                                                    {'component': 'div', 'text': f"提取邮箱: {link2_extracted_email or 'N/A'} ({ '✅匹配' if link2_status.get('email_match') else '❌不符' })"},
-                                                    {'component': 'div', 'text': f"提取等级: {link2_extracted_level or 'N/A'} ({ '✅通过' if link2_status.get('level_ok') else '❌不符' })"}
-                                                ]
-                                            }
-                                        ]
-                                    } if link2 else {}
-                                ]
-                            },
-                            # 记录时间和等待时长
-                            {
-                                'component': 'div',
-                                'props': {'class': 'd-flex align-center mt-2 text-caption text-grey-darken-1'},
-                                'content': [
-                                    {
-                                        'component': 'div',
-                                        'props': {'class': 'mr-4 d-flex align-center'},
-                                        'content': [
-                                             {'component': 'VIcon', 'props': {'size': 'x-small', 'class': 'mr-1'}, 'text': 'mdi-clock-outline'},
-                                             {'component': 'span', 'text': f'记录: {display_time}'}
-                                        ]
-                                    },
-                                    {
-                                        'component': 'div',
-                                        'props': {'class': 'd-flex align-center'},
-                                        'content': [
-                                             {'component': 'VIcon', 'props': {'size': 'x-small', 'class': 'mr-1', 'color': base_duration_color}, 'text': base_duration_icon},
-                                             {'component': 'span', 'text': f'已等: {duration_str}'}
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            })
-
-        # 最终页面结构 (与之前相同)
-        return [
-            {
-                'component': 'div',
-                'props': {'class': 'd-flex align-center mb-3'},
-                'content': [
-                    {'component': 'VIcon', 'props': {'size': 'large', 'color': 'primary', 'class': 'mr-2'}, 'text': 'mdi-account-multiple-check'},
-                    {
-                        'component': 'div',
-                        'content': [
-                            {'component': 'div', 'props': {'class': 'text-h6 font-weight-medium'}, 'text': '蜂巢待审核邀请列表'},
-                            {'component': 'div', 'props': {'class': 'text-body-2 text-grey-darken-1'}, 'text': f'当前共有 {len(invite_list)} 条待审核邀请记录'}
-                        ]
-                    }
-                ]
-            },
-            *invite_cards
-        ]
-
-    def stop_service(self):
-        """
-        停止服务并清理 scheduler
-        """
-        try:
-            if self._scheduler:
-                if self._scheduler.running:
-                    self._scheduler.remove_all_jobs()
-                    self._scheduler.shutdown()
-                    logger.info("蜂巢邀请监控服务的 Scheduler 已关闭")
-                self._scheduler = None
-        except Exception as e:
-            logger.error(f"停止服务失败: {str(e)}")
-
-    def check_invites(self):
-        """
-        检查待审核邀请
-        """
-        if not self._enabled:
-            return
-        
-        logger.info(f"开始检查蜂巢论坛待审核邀请...")
-
-        if not self._username or not self._password:
-            logger.error("用户名或密码未配置，无法检查待审核邀请")
-            self.send_msg("蜂巢邀请监控", "用户名或密码未配置，无法检查待审核邀请")
-            return
-
-        # 登录获取Cookie
-        proxies = self._get_proxies()
-        cookie = self._login_and_get_cookie(proxies)
-        if not cookie:
-            # 只记录日志，不发送通知，避免因网络问题频繁推送通知
-            logger.error("登录失败，无法获取Cookie")
-            return
-
-        # 检查待审核邀请
-        self._check_invites_with_cookie(cookie)
-
-    def _get_proxies(self):
-        """
-        获取代理设置
-        """
-        if not self._use_proxy:
-            logger.info("未启用代理")
-            return None
-            
-        try:
-            if hasattr(settings, 'PROXY') and settings.PROXY:
-                logger.info(f"使用系统代理: {settings.PROXY}")
-                return settings.PROXY
-            else:
-                logger.warning("系统代理未配置")
-                return None
-        except Exception as e:
-            logger.error(f"获取代理设置出错: {str(e)}")
-            return None
-
-    def _login_and_get_cookie(self, proxies=None):
-        """
-        使用用户名密码登录获取cookie (参考 fengchaosignin)
-        """
-        try:
-            logger.info(f"开始使用用户名'{self._username}'登录蜂巢论坛(邀请插件)...")
-            req = RequestUtils(proxies=proxies, timeout=30)
-            proxy_info = "代理" if proxies else "直接连接"
-            
-            # --- 第一步：GET请求获取CSRF和初始cookie --- 
-            logger.info(f"步骤1: GET请求获取CSRF和初始cookie (使用{proxy_info})...")
-            get_headers = {
-                "Accept": "*/*",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                "Cache-Control": "no-cache"
-            }
-            try:
-                res = req.get_res("https://pting.club", headers=get_headers)
-                if not res or res.status_code != 200:
-                    logger.error(f"GET请求失败，状态码: {res.status_code if res else '无响应'} (使用{proxy_info})")
-                    return None
-            except Exception as e:
-                logger.error(f"GET请求异常 (使用{proxy_info}): {str(e)}")
-                return None
-                
-            # 获取CSRF令牌 (优先从Header，其次HTML)
-            csrf_token = res.headers.get('x-csrf-token')
-            if not csrf_token:
-                pattern = r'"csrfToken":"(.*?)"'
-                csrf_matches = re.findall(pattern, res.text)
-                if csrf_matches:
-                    csrf_token = csrf_matches[0]
-                else:
-                    logger.error(f"无法获取CSRF令牌 (使用{proxy_info})")
-                    return None
-            logger.info(f"获取到CSRF令牌: {csrf_token}")
-            
-            # 获取初始session cookie
-            session_cookie = None
-            initial_cookies = res.cookies.get_dict()
-            session_cookie = initial_cookies.get('flarum_session')
-            if not session_cookie:
-                 # 尝试从 set-cookie Header 获取
-                 set_cookie_header = res.headers.get('set-cookie')
-                 if set_cookie_header:
-                     session_match = re.search(r'flarum_session=([^;]+)', set_cookie_header)
-                     if session_match:
-                         session_cookie = session_match.group(1)
-            
-            if not session_cookie:
-                logger.error(f"无法获取初始session cookie (使用{proxy_info})")
-                return None
-            logger.info(f"获取到初始session cookie: {session_cookie[:10]}...")
-                
-            # --- 第二步：POST请求登录 --- 
-            logger.info(f"步骤2: POST请求登录 (使用{proxy_info})...")
-            login_data = {
-                "identification": self._username,
-                "password": self._password,
-                "remember": True
-            }
-            login_headers = {
-                "Content-Type": "application/json",
-                "X-CSRF-Token": csrf_token,
-                "Cookie": f"flarum_session={session_cookie}", # 带上初始session cookie
-                "Accept": "*/*",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                "Cache-Control": "no-cache"
-            }
-            logger.info(f"登录数据: {{'identification': '{self._username}', 'password': '******', 'remember': True}}")
-            
-            try:
-                login_res = req.post_res(
-                    url="https://pting.club/login",
-                    json=login_data,
-                    headers=login_headers
-                )
-                if not login_res:
-                    logger.error(f"登录请求失败，未收到响应 (使用{proxy_info})")
-                    return None
-                logger.info(f"登录请求返回状态码: {login_res.status_code}")
-                if login_res.status_code != 200:
-                    logger.error(f"登录请求失败，状态码: {login_res.status_code} (使用{proxy_info})")
-                    try:
-                        error_content = login_res.text[:300] if login_res.text else "无响应内容"
-                        logger.error(f"登录错误响应: {error_content}")
-                    except:
-                        pass
-                    return None
-            except Exception as e:
-                logger.error(f"登录请求异常 (使用{proxy_info}): {str(e)}")
-                return None
-                
-            # --- 第三步：从登录响应中提取最终cookie --- 
-            logger.info(f"步骤3: 提取登录成功后的cookie (使用{proxy_info})...")
-            final_cookies = {}
-            
-            # 优先使用登录后响应的 cookies
-            login_response_cookies = login_res.cookies.get_dict()
-            final_cookies.update(login_response_cookies)
-            
-            # 检查 Set-Cookie Header，因为它可能包含 HttpOnly 的 cookie
-            set_cookie_header = login_res.headers.get('set-cookie')
-            if set_cookie_header:
-                logger.debug(f"登录响应包含set-cookie: {set_cookie_header[:100]}...")
-                session_match = re.search(r'flarum_session=([^;]+)', set_cookie_header)
-                if session_match:
-                    final_cookies['flarum_session'] = session_match.group(1)
-                    logger.debug(f"从set-cookie提取到session: {session_match.group(1)[:10]}...")
-                remember_match = re.search(r'flarum_remember=([^;]+)', set_cookie_header)
-                if remember_match:
-                    final_cookies['flarum_remember'] = remember_match.group(1)
-                    logger.debug(f"从set-cookie提取到remember: {remember_match.group(1)[:10]}...")
-            
-            # 确保 session cookie 存在
-            if 'flarum_session' not in final_cookies:
-                logger.warning(f"未能提取到最终的session cookie，尝试使用初始session cookie (使用{proxy_info})")
-                final_cookies['flarum_session'] = session_cookie
-                
-            # 构建最终 cookie 字符串
-            cookie_parts = [f"{k}={v}" for k, v in final_cookies.items() if v is not None] # 过滤掉 None 值
-            cookie_str = "; ".join(cookie_parts)
-            logger.info(f"最终cookie字符串: {cookie_str[:50]}... (使用{proxy_info})")
-            
-            # 验证cookie
-            if not self._verify_cookie(req, cookie_str, proxy_info):
-                 logger.error(f"登录后Cookie验证失败 (使用{proxy_info})")
-                 return None
-            
-            logger.info(f"登录并验证Cookie成功 (使用{proxy_info})")
-            return cookie_str
-                
-        except Exception as e:
-            logger.error(f"登录过程出错 (使用{proxy_info}): {str(e)}")
-            import traceback
-            logger.error(f"详细错误: {traceback.format_exc()}")
-            return None
-            
-    def _verify_cookie(self, req, cookie_str, proxy_info):
-        """验证cookie是否有效"""
-        try:
-            if not cookie_str:
-                logger.warning("尝试验证空cookie字符串")
-                return None
-                
-            logger.info(f"验证cookie有效性 (使用{proxy_info})...")
-            headers = {
-                "Cookie": cookie_str,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                "Accept": "*/*",
-                "Cache-Control": "no-cache"
-            }
-            
-            try:
-                # 访问首页进行验证
-                verify_res = req.get_res("https://pting.club", headers=headers)
-                if not verify_res or verify_res.status_code != 200:
-                    logger.error(f"验证cookie请求失败，状态码: {verify_res.status_code if verify_res else '无响应'} (使用{proxy_info})")
-                    return None
-            except Exception as e:
-                logger.error(f"验证cookie请求异常 (使用{proxy_info}): {str(e)}")
-                return None
-                
-            # 验证是否已登录（检查页面是否包含用户ID）
-            pattern = r'"userId":(\d+)'
-            user_matches = re.search(pattern, verify_res.text)
-            if not user_matches:
-                logger.error(f"验证cookie失败，响应中未找到userId (使用{proxy_info})")
-                # 打印部分响应内容用于调试
-                logger.debug(f"验证响应内容片段: {verify_res.text[:500] if verify_res else ''}")
-                return None
-                
-            user_id = user_matches.group(1)
-            if user_id == "0":
-                logger.error(f"验证cookie失败，userId为0，表示未登录状态 (使用{proxy_info})")
-                return None
-                
-            logger.info(f"Cookie验证成功，用户ID: {user_id} (使用{proxy_info})")
-            return cookie_str # 返回验证通过的 cookie 字符串
-        except Exception as e:
-            logger.error(f"验证cookie过程出错 (使用{proxy_info}): {str(e)}")
-            return None
-
-    def _check_invites_with_cookie(self, cookie, max_retries=None, retry_delay=None):
-        """使用获取到的Cookie检查待审核邀请"""
-        if not cookie:
-             logger.error("无效的Cookie，无法检查邀请")
-             return
-             
-        if max_retries is None:
-            max_retries = int(self._retry_count) 
-        if retry_delay is None:
-            retry_delay = int(self._retry_interval)
-
-        # 初始化 approved_items 变量，确保在所有代码路径下都有定义
-        approved_items = []
-
-        main_fengchao_username = None
-        fengchao_site_name = None
-        try:
-            if self.sites:
-                fengchao_site_config = next((s for s in self.sites.get_indexers() if "pting.club" in s.get("url", "") or s.get("name", "").lower() == "fengchao"), None)
-                if fengchao_site_config:
-                    fengchao_site_name = fengchao_site_config.get("name", "Fengchao")
-                    main_fengchao_username = fengchao_site_config.get("username")
-                    if main_fengchao_username:
-                        logger.info(f"获取到配置的蜂巢主用户名: {main_fengchao_username}")
-                    else:
-                        logger.warning(f"在站点 '{fengchao_site_name}' 配置中未找到主用户名 (username 字段)")
-                else:
-                    logger.warning("在 MoviePilot 配置中未找到蜂巢站点 (pting.club)")
-            else:
-                 logger.warning("SitesHelper 未初始化，无法获取主用户名")
-        except Exception as e:
-            logger.error(f"获取蜂巢主用户名时出错: {e}")
-
-        url = "https://pting.club/api/store/invite/list"
-        params = {
-            'filter[query]': "",
-            'filter[status]': "0",
-            'page[offset]': "0"
-        }
-        headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-            'Cookie': cookie
-        }
-        
-        proxies = self._get_proxies()
-        req_utils = RequestUtils(
-            proxies=proxies,
-            timeout=30
-        )
-        proxy_info = "代理" if proxies else "直接连接"
-        
-        retries = 0
-        while retries <= max_retries:
-            try:
-                logger.info(f"开始第 {retries+1}/{max_retries+1} 次尝试获取待审核邀请 (使用{proxy_info})...")
-                response = req_utils.get_res(url, params=params, headers=headers)
-                if not response or response.status_code != 200:
-                    logger.error(f"获取待审核邀请失败，状态码：{response.status_code if response else '未知'} (使用{proxy_info})")
-                    retries += 1
-                    if retries <= max_retries:
-                        logger.debug(f"第{retries}/{max_retries+1}次获取失败，将在 {retry_delay} 秒后重试...")
-                        time.sleep(retry_delay)
-                    continue
-                
-                try:
-                    data = response.json()
-                except Exception as e:
-                    logger.error(f"解析邀请响应数据失败: {str(e)} (使用{proxy_info})")
-                    retries += 1
-                    if retries <= max_retries:
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        break
-
-                if data.get('data'):
-                    logger.info(f"发现{len(data['data'])}个待审核邀请 (使用{proxy_info})")
-                    notification_items = []
-                    current_pending_details = {}
-                    previous_pending_timestamps = {k: v.get('timestamp') for k, v in (self.get_data('pending_invites_details') or {}).items() if v.get('timestamp')}
-
-                    items_to_process = list(data['data'])
-                    approved_ids = set()
-                    auto_approved_notification_items = []
-                    pending_reviews = []
-                    approved_items = [] # 修改：收集审核通过的详细信息
-
-                    for item in items_to_process:
-                        item_id = item['id']
-                        attributes = item.get('attributes', {})
-                        user = attributes.get('user', '未知')
-                        api_email = attributes.get('email', '未知')
-                        api_username = attributes.get('username', '未知')
-                        link1 = attributes.get('link', '')
-                        link2 = attributes.get('link2', '')
-                        now_iso = datetime.now().isoformat()
-
-                        is_main_account_invite = (api_email == self._username)
-
-                        link1_result = self._get_invitee_details_and_judge(link1) if link1 else {}
-                        link2_result = self._get_invitee_details_and_judge(link2) if link2 else {}
-
-                        link1_status = {"verified": False, "username_match": False, "email_match": False, "level_ok": False, "error": None}
-                        link2_status = {"verified": False, "username_match": False, "email_match": False, "level_ok": False, "error": None}
-                        extracted_level1 = None
-                        extracted_level2 = None
-
-                        # --- 填充 link1_status 和 extracted_level1 ---
-                        if link1_result:
-                             if link1_result.get("error_reason"): link1_status["error"] = link1_result["error_reason"]
-                             else:
-                                extracted_username1 = link1_result.get("extracted_username", "")
-                                extracted_email1 = link1_result.get("extracted_email", "")
-                                extracted_level1 = link1_result.get("extracted_level", "") # 赋值
-                                if api_username and extracted_username1 and api_username.lower() == extracted_username1.lower(): link1_status["username_match"] = True
-                                if api_email and extracted_email1 and api_email.lower() == extracted_email1.lower(): link1_status["email_match"] = True
-                                if extracted_level1 and extracted_level1 not in self.not_pass_levels: link1_status["level_ok"] = True
-                                if link1_status["username_match"] and link1_status["email_match"] and link1_status["level_ok"]: link1_status["verified"] = True
-
-                        # --- 填充 link2_status 和 extracted_level2 ---
-                        if link2_result:
-                             if link2_result.get("error_reason"): link2_status["error"] = link2_result["error_reason"]
-                             else:
-                                extracted_username2 = link2_result.get("extracted_username", "")
-                                extracted_email2 = link2_result.get("extracted_email", "")
-                                extracted_level2 = link2_result.get("extracted_level", "") # 赋值
-                                if api_username and extracted_username2 and api_username.lower() == extracted_username2.lower(): link2_status["username_match"] = True
-                                if api_email and extracted_email2 and api_email.lower() == extracted_email2.lower(): link2_status["email_match"] = True
-                                if extracted_level2 and extracted_level2 not in self.not_pass_levels: link2_status["level_ok"] = True
-                                if link2_status["username_match"] and link2_status["email_match"] and link2_status["level_ok"]: link2_status["verified"] = True
-
-                        # --- 判断最终状态 ---
-                        final_pass = False
-                        if link1 and link2: final_pass = link1_status["verified"] and link2_status["verified"]
-                        elif link1: final_pass = link1_status["verified"]
-                        elif link2: final_pass = link2_status["verified"]
-
-                        # --- 修改：构造 verified_link_details (包含两个链接的详情) ---
-                        verified_link_details = {}
-                        if final_pass:
-                            if link1_status["verified"]:
-                                verified_link_details['link1'] = {
-                                    'username': link1_result.get("extracted_username", '未知'),
-                                    'email': link1_result.get("extracted_email", '未知'),
-                                    'level': link1_result.get("extracted_level", '未知')
-                                }
-                            if link2_status["verified"]:
-                                verified_link_details['link2'] = {
-                                    'username': link2_result.get("extracted_username", '未知'),
-                                    'email': link2_result.get("extracted_email", '未知'),
-                                    'level': link2_result.get("extracted_level", '未知')
-                                }
-                            # 如果 final_pass 但 verified_link_details 为空 (理论不应发生), 记录警告
-                            if not verified_link_details:
-                                logger.warning(f"邀请 ID: {item_id} final_pass 为 True 但 verified_link_details 为空。")
-
-
-                        # --- 保存详细信息 ---
-                        current_pending_details[item_id] = {
-                            'timestamp': now_iso,
-                            'inviter': user,
-                            'invitee_email_api': api_email,
-                            'invitee_username_api': api_username,
-                            'link1': link1,
-                            'link2': link2,
-                            'is_main_account': is_main_account_invite,
-                            'link1_extracted_username': link1_result.get("extracted_username") if link1_result else None,
-                            'link1_extracted_email': link1_result.get("extracted_email") if link1_result else None,
-                            'link1_extracted_level': extracted_level1 if link1_result else None,
-                            'link1_status': link1_status,
-                            'link2_extracted_username': link2_result.get("extracted_username") if link2_result else None,
-                            'link2_extracted_email': link2_result.get("extracted_email") if link2_result else None,
-                            'link2_extracted_level': extracted_level2 if link2_result else None,
-                            'link2_status': link2_status,
-                            'final_pass_status': final_pass
-                        }
-
-                        is_new = item_id not in previous_pending_timestamps
-                        is_overtime = False
-                        if not is_new:
-                            last_timestamp_str = previous_pending_timestamps.get(item_id)
-                            if last_timestamp_str:
-                                try:
-                                    last_time_dt = datetime.fromisoformat(last_timestamp_str)
-                                    if (datetime.now(last_time_dt.tzinfo) - last_time_dt).total_seconds() > 4 * 3600:
-                                        is_overtime = True
-                                except ValueError:
-                                    logger.warning(f"无法解析上次记录的时间戳: {last_timestamp_str}")
-                                    is_overtime = True
-
-                        if is_new or is_overtime:
-                            notification_items.append({
-                                "邀请人": user,
-                                "受邀人邮箱(API)": api_email,
-                                "受邀人用户名(API)": api_username,
-                                "链接1": link1,
-                                "链接2": link2,
-                                "链接1用户名": link1_result.get("extracted_username") if link1_result else 'N/A',
-                                "链接1邮箱": link1_result.get("extracted_email") if link1_result else 'N/A',
-                                "链接1等级": extracted_level1 if link1_result else 'N/A',
-                                "链接1状态": link1_status,
-                                "链接2用户名": link2_result.get("extracted_username") if link2_result else 'N/A',
-                                "链接2邮箱": link2_result.get("extracted_email") if link2_result else 'N/A',
-                                "链接2等级": extracted_level2 if link2_result else 'N/A',
-                                "链接2状态": link2_status,
-                                "最终状态": "通过" if final_pass else "不通过",
-                                "通知原因": "新邀请" if is_new else "超过4小时未审核",
-                                "is_main_account": is_main_account_invite
-                            })
-                            logger.debug(f"{ '新增' if is_new else '超时' }待审核邀请，准备通知: {item_id} (使用{proxy_info}){' (主账号)' if is_main_account_invite else ''}, 最终判断: {'通过' if final_pass else '不通过'}")
-
-                        # --- 新的自动审核逻辑 ---
-                        perform_auto_approve = False
-                        level_to_check = '' # 用于检查 VIP
-                        if self._auto_approve_enabled and final_pass and verified_link_details:
-                            # 获取任一验证通过链接的等级用于 VIP 检查
-                            if 'link1' in verified_link_details:
-                                level_to_check = verified_link_details['link1'].get('level', '').lower()
-                            elif 'link2' in verified_link_details:
-                                level_to_check = verified_link_details['link2'].get('level', '').lower()
-
-                            if "vip" in level_to_check:
-                                logger.info(f"邀请 ID: {item_id} 验证通过但等级含 VIP ({level_to_check.upper()})，不进行自动审核。")
-                            else:
-                                perform_auto_approve = True
-                        elif self._auto_approve_enabled and final_pass and not verified_link_details:
-                             logger.warning(f"邀请 ID: {item_id} 验证通过但未能构造 verified_link_details，无法自动审核。")
-
-
-                        if perform_auto_approve:
-                            logger.info(f"邀请 ID: {item_id} 满足自动审核条件，尝试自动通过...")
-                            csrf_token = self._get_csrf_token(req_utils, cookie)
-                            if csrf_token:
-                                # --- 修改：调用新的自动审核函数，传递 verified_link_details ---
-                                if self._auto_approve_invite(req_utils, int(item_id), verified_link_details, cookie, csrf_token):
-                                    logger.info(f"邀请 ID: {item_id} 自动审核成功！")
-                                    # --- 修改：approved_items 存储 verified_link_details ---
-                                    approved_items.append({
-                                        "invite_id": item_id,
-                                        "verified_details": verified_link_details,
-                                        # 也存储 API 信息以备用
-                                        "api_username": api_username,
-                                        "api_email": api_email
-                                    })
-                                    current_pending_details.pop(item_id, None)
-                                    continue # 跳过后续添加到 pending_reviews 的步骤
-                                else:
-                                    logger.error(f"邀请 ID: {item_id} 自动审核 API 调用失败，将按正常流程处理（保存并通知）。")
-                            else:
-                                logger.error(f"未能获取 CSRF 令牌，无法为邀请 ID {item_id} 尝试自动审核。")
-
-                        # 如果没有被自动审核成功并 continue，则添加到待处理列表 (逻辑不变)
-                        if any(i.get('id') == item_id for i in items_to_process):
-                             pending_reviews.append(item)
-
-
-                    # --- 循环结束后 ---
-                    # 发送待审核邀请通知 (逻辑不变，但 TODO 部分已修正)
-                    if notification_items and self._notify:
-                        final_notification_items = [
-                            n_item for n_item in notification_items
-                            # 使用 n_item['id'] 或 n_item.get('id', 'some_default_if_missing')
-                            # 假设 notification_items 里的 id 字段与 item_id 对应
-                            if not any(a_item['invite_id'] == n_item.get("id") for a_item in approved_items)
-                        ]
-                        if final_notification_items:
-                             self._send_invites_notification(final_notification_items)
-
-
-                    # 保存最终的待处理详情 (逻辑不变)
-                    self.save_data('pending_invites_details', current_pending_details)
-
-                else:
-                    logger.info(f"没有待审核的邀请 (使用{proxy_info})")
-                    if self.get_data('pending_invites_details'):
-                        self.save_data('pending_invites_details', {})
-                        logger.info("已清空存储的待审核邀请详情")
-
-                break # 成功获取并处理后退出重试循环
-
-            except Exception as e:
-                logger.error(f"检查待审核邀请过程中发生异常: {str(e)} (使用{proxy_info})")
-                logger.error(traceback.format_exc())
-                retries += 1
-                if retries <= max_retries:
-                    logger.debug(f"发生异常，将在 {retry_delay} 秒后进行第 {retries+1}/{max_retries+1} 次重试...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"已达到最大重试次数 ({max_retries+1})，请求失败 (使用{proxy_info})")
-                    break
-
-        # --- 函数末尾 ---
-        # 发送自动审核通过的通知 (逻辑不变，但会调用更新后的 _send_auto_approval_notification)
-        if approved_items:
-            self._send_auto_approval_notification(approved_items)
-
-        # 发送待审核邀请的通知 (注释掉的逻辑保持不变)
-        # ...
-
-    def _send_invites_notification(self, items):
-        """
-        发送待审核邀请通知 (格式不变)
-        """
-        if not items:
-            return
-            
-        try:
-            title = f"【蜂巢论坛】{len(items)} 条待审核邀请提醒"
-            
-            # 构建纯文本通知内容
-            text_lines = [f"🐝 蜂巢论坛发现 {len(items)} 条待审核邀请："] 
-            
-            for i, item in enumerate(items, 1):
-                is_main = item.get("is_main_account", False)
-                main_account_tag = "(主账号邀请)" if is_main else ""
-                final_status = item.get("最终状态", "未知")
-                status_icon = "✅" if final_status == "通过" else "❌" if final_status == "不通过" else "❓"
-                
-                # 使用空行和更清晰的分隔符
-                text_lines.append("\n------------------------------")
-                text_lines.append(f"【{i}】{item.get('通知原因')} {main_account_tag} {status_icon}{final_status}")
-                text_lines.append(f"邀请人: {item.get('邀请人', '未知')}")
-                text_lines.append(f"受邀人(API): {item.get('受邀人用户名(API)', '?')} / {item.get('受邀人邮箱(API)', '?')}")
-                text_lines.append("") # 添加空行增加间距
-                
-                # 链接1 详情
-                link1 = item.get('链接1', '')
-                text_lines.append("🔗 链接1: " + (f' {link1} ' if link1 else "无")) # 链接前后加空格
-                if link1:
-                    l1_status = item.get('链接1状态', {})
-                    l1_error = l1_status.get('error')
-                    if l1_error:
-                         text_lines.append(f"  └─ 验证失败: {l1_error}")
-                    else:
-                        l1_user = item.get('链接1用户名', 'N/A')
-                        l1_email = item.get('链接1邮箱', 'N/A')
-                        l1_level = item.get('链接1等级', 'N/A')
-                        l1_user_match = "✅" if l1_status.get('username_match') else "❌"
-                        l1_email_match = "✅" if l1_status.get('email_match') else "❌"
-                        l1_level_ok = "✅" if l1_status.get('level_ok') else "❌"
-                        text_lines.append(f"  └─ 提取: 用户={l1_user}({l1_user_match}{'匹配' if l1_status.get('username_match') else '不符'}) | "
-                                          f"邮箱={l1_email}({l1_email_match}{'匹配' if l1_status.get('email_match') else '不符'}) | "
-                                          f"等级={l1_level}({l1_level_ok}{'通过' if l1_status.get('level_ok') else '不符'})")
-                text_lines.append("") # 添加空行
-
-                # 链接2 详情
-                link2 = item.get('链接2', '')
-                text_lines.append("🔗 链接2: " + (f' {link2} ' if link2 else "无")) # 链接前后加空格
-                if link2:
-                    l2_status = item.get('链接2状态', {})
-                    l2_error = l2_status.get('error')
-                    if l2_error:
-                         text_lines.append(f"  └─ 验证失败: {l2_error}")
-                    else:
-                        l2_user = item.get('链接2用户名', 'N/A')
-                        l2_email = item.get('链接2邮箱', 'N/A')
-                        l2_level = item.get('链接2等级', 'N/A')
-                        l2_user_match = "✅" if l2_status.get('username_match') else "❌"
-                        l2_email_match = "✅" if l2_status.get('email_match') else "❌"
-                        l2_level_ok = "✅" if l2_status.get('level_ok') else "❌"
-                        text_lines.append(f"  └─ 提取: 用户={l2_user}({l2_user_match}{'匹配' if l2_status.get('username_match') else '不符'}) | "
-                                          f"邮箱={l2_email}({l2_email_match}{'匹配' if l2_status.get('email_match') else '不符'}) | "
-                                          f"等级={l2_level}({l2_level_ok}{'通过' if l2_status.get('level_ok') else '不符'})")
-            
-            text_lines.append("\n------------------------------")
-            text_lines.append("\n请尽快处理。")
-            text = "\n".join(text_lines) 
-            
-            # 发送通知 (调用 send_msg)
-            self.send_msg(title=title, text=text)
-            logger.info(f"已发送 {len(items)} 个待审核邀请通知 (纯文本格式)")
-            
-        except Exception as e:
-            logger.error(f"发送纯文本通知失败: {str(e)}")
-
-    def _send_auto_approval_notification(self, approved_items: List[Dict[str, Any]]):
-        """发送自动审核成功的通知 (改进格式和内容)"""
-        if not self._notify or not approved_items:
-            return
-
-        count = len(approved_items)
-        title = f"✅ 蜂巢论坛：{count} 个邀请已自动审核通过"
-        
-        text_lines = [f"🐝 以下 {count} 个邀请已通过验证并自动审核通过："]
-
-        for i, item in enumerate(approved_items, 1):
-            invite_id = item.get('invite_id', '未知')
-            details = item.get('verified_details', {})
-            api_user = item.get('api_username', '?')
-            api_email = item.get('api_email', '?')
-            
-            text_lines.append(f"\n=== 【{i}】ID: {invite_id} ===")
-            text_lines.append(f"📝 API信息: 用户={api_user} | 邮箱={api_email}")
-
-            verified_links = []
-            if 'link1' in details:
-                verified_links.append("链接1")
-            if 'link2' in details:
-                verified_links.append("链接2")
-            
-            text_lines.append(f"✅ 验证通过: {', '.join(verified_links)}")
-            
-            if 'link1' in details:
-                l1_info = details['link1']
-                l1_user = l1_info.get('username', '未知')
-                l1_email = l1_info.get('email', '未知')
-                l1_level = l1_info.get('level', '未知')
-                text_lines.append("🔗 链接1验证结果:")
-                text_lines.append(f"   👤 用户: {l1_user}")
-                text_lines.append(f"   📧 邮箱: {l1_email}")
-                text_lines.append(f"   🏅 等级: {l1_level}")
-            else:
-                text_lines.append("🔗 链接1: 未验证或未提供")
-
-            if 'link2' in details:
-                l2_info = details['link2']
-                l2_user = l2_info.get('username', '未知')
-                l2_email = l2_info.get('email', '未知')
-                l2_level = l2_info.get('level', '未知')
-                text_lines.append("🔗 链接2验证结果:")
-                text_lines.append(f"   👤 用户: {l2_user}")
-                text_lines.append(f"   📧 邮箱: {l2_email}")
-                text_lines.append(f"   🏅 等级: {l2_level}")
-            else:
-                text_lines.append("🔗 链接2: 未验证或未提供")
-
-        text_lines.append("\n💬 备注已提交至蜂巢论坛，包含所有验证细节。")
-        text = "\n".join(text_lines)
-
-        self.send_msg(title, text, self.plugin_icon)
-        logger.info(f"已发送 {count} 个邀请自动审核通过的通知。")
-
-    def send_msg(self, title, text="", image=""):
-        """发送消息 (逻辑不变)"""
-        if not self._notify:
-            return
-        
-        try:
-            self.post_message(mtype=NotificationType.SiteMessage, title=title, text=text)
-        except Exception as e:
-            logger.error(f"发送通知失败: {str(e)}")
-
-    def _get_invitee_details_and_judge(self, invite_url: str) -> Dict[str, str]:
-        """访问邀请链接提取信息 (逻辑不变)"""
-        # 返回的字典结构
-        result = {
-            "extracted_email": "无法访问/提取",
-            "extracted_level": "无法访问/提取",
-            "extracted_username": "无法访问/提取", # 新增字段
-            "error_reason": None 
-        }
-
-        if not invite_url or not self.sites:
-            logger.warning(f"邀请链接为空或 SitesHelper 未初始化，无法提取信息")
-            result["error_reason"] = "链接为空或插件未就绪"
-            return result
-
-        # --- 解析链接，查找匹配站点，获取Cookie和UA (这部分逻辑不变) --- 
-        try:
-            parsed_url = urlparse(invite_url)
-            hostname = parsed_url.netloc
-        except Exception as e:
-            logger.error(f"解析邀请链接失败: {invite_url}, 错误: {e}")
-            result["error_reason"] = f"链接解析失败: {e}"
-            return result
-
-        matched_site = None
-        site_cookie = None
-        site_ua = None
-        site_name_for_log = "未知站点"
-        try:
-            for site in self.sites.get_indexers():
-                 site_url_config = site.get("url")
-                 if not site_url_config:
-                      continue
-                 site_hostname = urlparse(site_url_config).netloc
-                 site_name_for_log = site.get('name', '未知站点')
-                 
-                 if hostname == site_hostname:
-                      matched_site = site
-                      logger.info(f"找到匹配站点: {site_name_for_log} for url: {invite_url}")
-                      site_cookie = matched_site.get("cookie")
-                      site_ua = matched_site.get("ua")
-                      if not site_cookie:
-                          logger.warning(f"站点 {site_name_for_log} 已找到，但未配置 Cookie")
-                      else:
-                          logger.info(f"获取到站点 {site_name_for_log} 的 Cookie")
-                      break
-        except Exception as e:
-             logger.error(f"查找匹配站点时出错: {e}")
-             result["error_reason"] = f"查找站点配置出错: {e}"
-             return result
-
-        if not matched_site:
-            logger.warning(f"未找到与邀请链接 {invite_url} 域名匹配的已配置站点")
-            result["error_reason"] = "未找到匹配的 MoviePilot 站点"
-            return result
-            
-        if not site_cookie:
-            logger.warning(f"站点 {matched_site.get('name', '未知')} 未配置 Cookie，无法访问链接 {invite_url}")
-            result["error_reason"] = f"匹配站点 ({matched_site.get('name', '未知')}) 未配置 Cookie"
-            return result
-
-        # --- 准备请求 --- 
-        proxies = self._get_proxies()
-        request_headers = {
-            'User-Agent': site_ua or settings.USER_AGENT, 
-            'Cookie': site_cookie, 
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
-            'Cache-Control': 'max-age=0',
-            # 'Referer': matched_site.get("url") # Referer 有时会导致问题，先去掉试试
-        }
-        req_proxies = None
-        if proxies and isinstance(proxies, dict) and proxies.get('http'):
-             req_proxies = {'http': proxies['http'], 'https': proxies['http']}
-        elif proxies and isinstance(proxies, str):
-             req_proxies = {'http': proxies, 'https': proxies}
-
-        req_utils = RequestUtils(headers=request_headers, proxies=req_proxies, timeout=45) # 增加超时
-        proxy_info = "代理" if req_proxies else "直接连接"
-
-        # --- 访问邀请链接并提取信息 --- 
-        try:
-            logger.info(f"尝试访问邀请链接: {invite_url} (使用站点 {matched_site.get('name')} 的Cookie和{proxy_info})")
-            # 尝试禁用SSL验证，某些站点可能证书有问题
-            response = req_utils.get_res(invite_url, verify=False)
-            
-            if response is None:
-                logger.error(f"访问邀请链接失败，无响应 (站点: {matched_site.get('name')}, {proxy_info})")
-                result["error_reason"] = f"访问链接无响应"
-                return result
-                
-            # 检查是否因为Cookie无效导致重定向到登录页
-            if response.status_code in [301, 302, 307] and 'login.php' in response.headers.get('Location', ''):
-                 logger.error(f"访问邀请链接失败，Cookie可能无效，重定向到登录页 (站点: {matched_site.get('name')}, {proxy_info})")
-                 result["error_reason"] = f"Cookie无效(重定向到登录页)"
-                 return result
-            elif response.status_code != 200:
-                logger.error(f"访问邀请链接失败，状态码: {response.status_code} (站点: {matched_site.get('name')}, {proxy_info})")
-                # 记录部分响应内容帮助诊断
-                try:
-                     error_text = response.text[:300]
-                     logger.debug(f"访问失败响应内容片段: {error_text}")
-                except Exception:
-                     logger.debug("无法读取访问失败的响应内容")
-                result["error_reason"] = f"访问链接失败 (状态码: {response.status_code})"
-                return result
-
-            html_content = response.text
-            # 检查页面内容是否过短，可能为空白页或错误页
-            if len(html_content) < 500:
-                logger.warning(f"访问邀请链接 {invite_url} 返回内容过短 ({len(html_content)} bytes)，可能不是有效的用户详情页。")
-                # 尝试记录内容片段
-                logger.debug(f"过短响应内容片段: {html_content[:300]}")
-                result["error_reason"] = f"页面内容过短，可能无效"
-                # 虽然内容短，但仍然尝试提取，万一有用呢
-
-            logger.info(f"成功访问邀请链接: {invite_url}, 页面长度: {len(html_content)}")
-            
-            # 使用 BeautifulSoup 解析 HTML
-            soup = BeautifulSoup(html_content, 'html.parser')
-
-            # --- 提取用户名 --- 
-            # 油猴脚本 XPath: //*[@id="outer"]//h1//b
-            # CSS Selector: #outer h1 b
-            username_tag = soup.select_one('#outer h1 b')
-            if username_tag:
-                result["extracted_username"] = username_tag.get_text(strip=True)
-                logger.info(f"提取到用户名 (h1 b): {result['extracted_username']}")
-            else:
-                # 备选方案：查找页面标题中的用户名 (可能不准)
-                title_text = soup.title.string if soup.title else ""
-                # 假设标题格式类似 "用户详情 - 用户名" 或 "用户名 - 用户详情"
-                username_match_title = re.search(r'(?:用户详情\s*-\s*|Details\s*for\s*|User\s*details\s*-\s*)(.+?)(?:\s*-|\s*\$|$)', title_text, re.I)
-                if username_match_title:
-                     result["extracted_username"] = username_match_title.group(1).strip()
-                     logger.info(f"提取到用户名 (备选 title): {result['extracted_username']}")
-                else:
-                     logger.warning(f"在链接 {invite_url} 未找到用户名信息 (#outer h1 b 或 title)")
-                     result["extracted_username"] = "未提取到用户名"
-
-            # --- 提取邮箱 --- 
-            # 查找 mailto: 链接
-            email_tag = soup.find('a', href=lambda href: href and href.startswith('mailto:'))
-            if email_tag:
-                result["extracted_email"] = email_tag.get_text(strip=True) or email_tag['href'].split(':')[1]
-                logger.info(f"提取到邮箱 (mailto): {result['extracted_email']}")
-            else:
-                # 备选方案：尝试从表格单元格提取
-                email_td = soup.find('td', string=re.compile(r'邮箱|Email', re.I))
-                if email_td and email_td.find_next_sibling('td'):
-                    email_sibling_td = email_td.find_next_sibling('td')
-                    email_tag_in_td = email_sibling_td.find('a', href=lambda href: href and href.startswith('mailto:'))
-                    if email_tag_in_td:
-                        result["extracted_email"] = email_tag_in_td.get_text(strip=True) or email_tag_in_td['href'].split(':')[1]
-                        logger.info(f"提取到邮箱 (备选 td mailto): {result['extracted_email']}")
-                    elif '@' in email_sibling_td.get_text(strip=True): # 简单判断是否像邮箱
-                        result["extracted_email"] = email_sibling_td.get_text(strip=True)
-                        logger.info(f"提取到邮箱 (备选 td text): {result['extracted_email']}")
-                    else:
-                        logger.warning(f"在链接 {invite_url} 未找到邮箱信息 (mailto 或 td)")
-                        # --- 新增 Regex 备选 ---
-                        email_regex = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-                        # 在整个HTML中查找第一个匹配的邮箱
-                        regex_match = re.search(email_regex, html_content)
-                        if regex_match:
-                            result["extracted_email"] = regex_match.group(0)
-                            logger.info(f"提取到邮箱 (备选 Regex): {result['extracted_email']}")
-                        else:
-                            logger.warning(f"在链接 {invite_url} 未找到邮箱信息 (mailto, td, 或 regex)")
-                            result["extracted_email"] = "未提取到邮箱"
-                        # --- Regex 备选结束 ---
-                else:
-                    logger.warning(f"在链接 {invite_url} 未找到邮箱信息 (mailto 或 td)")
-                    result["extracted_email"] = "未提取到邮箱"
-
-            # --- 提取等级 --- 
-            # 严格按照脚本逻辑: 找包含"等级"的td -> 找兄弟td -> 找里面的img -> 取title
-            level_td_label = soup.find('td', string=re.compile(r'等级|Class', re.I)) # 大小写不敏感
-            extracted_level_text = "未提取到等级"
-            if level_td_label and level_td_label.find_next_sibling('td'):
-                level_td_value = level_td_label.find_next_sibling('td')
-                level_img_in_td = level_td_value.find('img', title=True)
-                if level_img_in_td and level_img_in_td['title']:
-                    extracted_level_text = level_img_in_td['title'].strip()
-                    logger.info(f"提取到等级 (img title): {extracted_level_text}")
-                else:
-                    # 如果没有图片，尝试直接获取单元格文本
-                    level_text_in_td = level_td_value.get_text(strip=True)
-                    if level_text_in_td:
-                        extracted_level_text = level_text_in_td
-                        logger.warning(f"在等级单元格中未找到 img[title]，使用单元格文本作为备选: {extracted_level_text}")
-                    else:
-                        logger.warning(f"在链接 {invite_url} 的等级单元格中未找到 img[title] 或有效文本")
-            else:
-                logger.warning(f"在链接 {invite_url} 未找到等级信息 (未找到'等级'单元格或其兄弟单元格)")
-            
-            result["extracted_level"] = extracted_level_text
-
-            # 如果都无法提取，记录错误
-            if result["extracted_email"] == "无法访问/提取" and result["extracted_level"] == "无法访问/提取" and result["extracted_username"] == "无法访问/提取":
-                 result["error_reason"] = "页面访问成功但无法提取用户名、邮箱和等级"
-
-            return result
-
-        except requests.exceptions.Timeout:
-            logger.error(f"访问邀请链接 {invite_url} 超时 (站点: {matched_site.get('name')}, {proxy_info})")
-            result["error_reason"] = "访问链接超时"
-            return result
-        except requests.exceptions.RequestException as e:
-            logger.error(f"访问邀请链接 {invite_url} 发生网络错误: {e} (站点: {matched_site.get('name')}, {proxy_info})")
-            result["error_reason"] = f"网络错误: {e}"
-            return result
-        except Exception as e:
-            logger.error(f"处理邀请链接 {invite_url} 时发生未知异常: {e}")
-            logger.error(traceback.format_exc())
-            result["error_reason"] = f"处理异常: {e}"
-            return result
-
-    def _get_csrf_token(self, req_utils: RequestUtils, cookie: str) -> Optional[str]:
-        """获取 CSRF 令牌 (逻辑不变)"""
-        try:
-            logger.debug("尝试获取最新的 CSRF 令牌...")
-            get_headers = {
-                "Accept": "*/*",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                "Cache-Control": "no-cache",
-                "Cookie": cookie
-            }
-            res = req_utils.get_res("https://pting.club", headers=get_headers)
-            if not res or res.status_code != 200:
-                logger.error(f"获取 CSRF 令牌失败，状态码: {res.status_code if res else '无响应'}")
-                return None
-
-            # 优先从 Header 获取
-            csrf_token = res.headers.get('x-csrf-token')
-            if csrf_token:
-                logger.debug(f"从 Header 获取到 CSRF 令牌: {csrf_token}")
-                return csrf_token
-
-            # 其次从 HTML 获取
-            pattern = r'"csrfToken":"(.*?)"'
-            csrf_matches = re.findall(pattern, res.text)
-            if csrf_matches:
-                csrf_token = csrf_matches[0]
-                logger.debug(f"从 HTML 获取到 CSRF 令牌: {csrf_token}")
-                return csrf_token
-
-            logger.error("无法从响应中提取 CSRF 令牌")
-            return None
-        except Exception as e:
-            logger.error(f"获取 CSRF 令牌时发生异常: {str(e)}")
-            return None
-
-    def _auto_approve_invite(self, req_utils: RequestUtils, invite_id: int, verified_details: Dict[str, Dict[str, str]], cookie: str, csrf_token: str) -> bool:
-        """
-        调用 API 自动通过邀请审核 (使用双链接详情)。
-        :param req_utils: RequestUtils 实例。
-        :param invite_id: 邀请 ID。
-        :param verified_details: 包含已验证链接详情的字典, e.g., {'link1': {...}, 'link2': {...}}。
-        :param cookie: Cookie 字符串。
-        :param csrf_token: CSRF 令牌。
-        :return: True 如果成功, False 如果失败。
-        """
-        if not all([req_utils, invite_id, verified_details, cookie, csrf_token]):
-            logger.error(f"自动审核参数不足 (ID: {invite_id})，无法执行。verified_details: {bool(verified_details)}")
-            return False
-
-        url = "https://pting.club/api/store/invite/edit"
-        
-        # --- 构造更详细的备注 ---
-        remark_parts = ["自动审核通过"]
-        if 'link1' in verified_details:
-            l1 = verified_details['link1']
-            remark_parts.append(f"L1: U={l1.get('username','?')}, E={l1.get('email','?')}, L={l1.get('level','?')} ✅")
-        if 'link2' in verified_details:
-            l2 = verified_details['link2']
-            remark_parts.append(f"L2: U={l2.get('username','?')}, E={l2.get('email','?')}, L={l2.get('level','?')} ✅")
-        
-        remark = " | ".join(remark_parts)
-        # 限制备注长度，以防超出 API 限制 (假设限制 255)
-        max_remark_len = 250 
-        if len(remark) > max_remark_len:
-            remark = remark[:max_remark_len] + "..."
-            
-        payload = {
-            "id": int(invite_id),
-            "status": 1, # 1 表示通过
-            "confirmRemark": remark # 使用包含双链接细节的备注
-        }
-        headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-            'x-csrf-token': csrf_token,
-            'Cookie': cookie,
-            'Content-Type': 'application/json; charset=utf-8',
-            'Accept': 'application/json, text/plain, */*'
-        }
-        proxy_info = "代理" if req_utils._proxies else "直接连接"
-
-        try:
-            # 日志中也体现是基于双链接审核
-            log_user_level = "未知"
-            if 'link1' in verified_details: log_user_level = f"{verified_details['link1'].get('username','?')}({verified_details['link1'].get('level','?')})"
-            elif 'link2' in verified_details: log_user_level = f"{verified_details['link2'].get('username','?')}({verified_details['link2'].get('level','?')})"
-            
-            logger.info(f"尝试自动审核通过邀请 ID: {invite_id} (基于验证通过的链接: {list(verified_details.keys())}, 用户/等级: {log_user_level}, 使用 {proxy_info})...")
-            response = req_utils.put_res(url, json=payload, headers=headers)
-
-            if response is None:
-                logger.error(f"自动审核 API 请求失败，无响应 (ID: {invite_id}, 使用 {proxy_info})")
-                return False
-
-            if response.status_code == 200:
-                logger.info(f"自动审核邀请 ID: {invite_id} 成功 (状态码: 200)。API响应: {response.text[:200]}")
-                return True
-            else:
-                logger.error(f"自动审核 API 请求失败，状态码: {response.status_code} (ID: {invite_id}, 使用 {proxy_info})")
-                logger.debug(f"失败响应内容: {response.text[:300]}")
-                return False
-
-        except Exception as e:
-            logger.error(f"自动审核 API 请求时发生异常 (ID: {invite_id}, 使用 {proxy_info}): {str(e)}")
-            logger.error(traceback.format_exc())
-            return False
+        return []
 
 
 plugin_class = LuckPTAutoReview
