@@ -52,6 +52,38 @@ DEFAULT_LEVEL_ALIASES: Dict[str, str] = {
     "extremeuser": "Extreme User",
     "ultimateuser": "Ultimate User",
     "nexusmaster": "Nexus Master",
+    "波斯猫": "Peasant",
+    "伯曼猫": "User",
+    "加菲猫": "Power User",
+    "布偶猫": "Elite User",
+    "雪鞋猫": "Crazy User",
+    "暹罗猫": "Insane User",
+    "安哥拉猫": "Veteran User",
+    "孟加拉猫": "Extreme User",
+    "山东狮子猫": "Ultimate User",
+    "四川简州猫": "Nexus Master",
+    "挪威森林猫": "贵宾 (VIP)",
+    "挪威森林猫 vip": "贵宾 (VIP)",
+    "美国短毛猫": "养老族 (Retiree)",
+    "英國短毛貓": "发布员 (Uploader)",
+    "英国短毛猫": "发布员 (Uploader)",
+    "俄罗斯蓝猫": "总版主 (Moderator)",
+    "俄羅斯藍貓": "总版主 (Moderator)",
+    "中华田园猫": "管理员 (Administrator)",
+    "蘇格蘭摺耳貓": "维护开发员 (Sysop)",
+    "苏格兰折耳猫": "维护开发员 (Sysop)",
+    "阿比西尼亚猫": "主管 (Staff Leader)",
+    "阿比西尼亞貓": "主管 (Staff Leader)",
+    "游魂": "Peasant",
+    "临时演员": "User",
+    "跑龙套": "Power User",
+    "配角": "Elite User",
+    "主演": "Crazy User",
+    "领衔主演": "Insane User",
+    "明星": "Veteran User",
+    "国际大腕": "Extreme User",
+    "影帝": "Ultimate User",
+    "终身影帝": "Nexus Master",
     "vip": "贵宾 (VIP)",
     "v i p": "贵宾 (VIP)",
     "貴賓": "贵宾 (VIP)",
@@ -164,8 +196,13 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("上将", "Nexus Master"),
     ("航空母舰", "Nexus Master"),
     ("宅神", "Nexus Master"),
+    ("四川简州猫", "Nexus Master"),
+    ("挪威森林猫 vip", "贵宾 (VIP)"),
+    ("终身影帝", "Nexus Master"),
     ("神仙", "Ultimate User"),
     ("ultimate user", "Ultimate User"),
+    ("山东狮子猫", "Ultimate User"),
+    ("影帝", "Ultimate User"),
     ("幻梦", "Ultimate User"),
     ("副都统", "Ultimate User"),
     ("中将", "Ultimate User"),
@@ -174,15 +211,19 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("宅聖", "Ultimate User"),
     ("大师", "Extreme User"),
     ("extreme user", "Extreme User"),
+    ("孟加拉猫", "Extreme User"),
     ("归尘", "Extreme User"),
     ("正参领", "Extreme User"),
     ("少将", "Extreme User"),
     ("巡洋舰", "Extreme User"),
     ("宅贤者", "Extreme User"),
     ("宅賢者", "Extreme User"),
+    ("国际大腕", "Extreme User"),
     ("veteran", "Veteran User"),
     ("veteran user", "Veteran User"),
+    ("安哥拉猫", "Veteran User"),
     ("翩跹", "Veteran User"),
+    ("明星", "Veteran User"),
     ("副参领", "Veteran User"),
     ("上校", "Veteran User"),
     ("驱逐舰", "Veteran User"),
@@ -190,7 +231,9 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("宅護法", "Veteran User"),
     ("insane", "Insane User"),
     ("insane user", "Insane User"),
+    ("暹罗猫", "Insane User"),
     ("恋风", "Insane User"),
+    ("领衔主演", "Insane User"),
     ("正军校", "Insane User"),
     ("中校", "Insane User"),
     ("邮轮", "Insane User"),
@@ -198,6 +241,8 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("宅傳教士", "Insane User"),
     ("crazy", "Crazy User"),
     ("crazy user", "Crazy User"),
+    ("雪鞋猫", "Crazy User"),
+    ("主演", "Crazy User"),
     ("破茧", "Crazy User"),
     ("副军校", "Crazy User"),
     ("少校", "Crazy User"),
@@ -205,6 +250,8 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("宅教士", "Crazy User"),
     ("精英", "Elite User"),
     ("elite user", "Elite User"),
+    ("布偶猫", "Elite User"),
+    ("配角", "Elite User"),
     ("军士", "Elite User"),
     ("化蛹", "Elite User"),
     ("尉官", "Elite User"),
@@ -214,16 +261,22 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("易形", "Power User"),
     ("power", "Power User"),
     ("power user", "Power User"),
+    ("加菲猫", "Power User"),
+    ("跑龙套", "Power User"),
     ("士官", "Power User"),
     ("独木舟", "Power User"),
     ("御宅族", "Power User"),
     ("新人", "User"),
+    ("临时演员", "User"),
+    ("伯曼猫", "User"),
     ("萌动", "User"),
     ("平民", "User"),
     ("列兵", "User"),
     ("澡盆", "User"),
     ("路人", "User"),
     ("吸血鬼", "Peasant"),
+    ("波斯猫", "Peasant"),
+    ("游魂", "Peasant"),
     ("惊蛰", "Peasant"),
     ("叛徒", "Peasant"),
     ("庶民", "Peasant"),
@@ -239,22 +292,29 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("管理员", "管理员 (Administrator)"),
     ("站长", "管理员 (Administrator)"),
     ("administrator", "管理员 (Administrator)"),
+    ("中华田园猫", "管理员 (Administrator)"),
     ("sysop", "维护开发员 (Sysop)"),
+    ("苏格兰折耳猫", "维护开发员 (Sysop)"),
     ("staff leader", "主管 (Staff Leader)"),
+    ("阿比西尼亚猫", "主管 (Staff Leader)"),
     ("retiree", "养老族 (Retiree)"),
     ("养老族", "养老族 (Retiree)"),
+    ("美国短毛猫", "养老族 (Retiree)"),
     ("vip", "贵宾 (VIP)"),
     ("贵宾", "贵宾 (VIP)"),
     ("貴賓", "贵宾 (VIP)"),
+    ("挪威森林猫", "贵宾 (VIP)"),
     ("荣誉会员", "贵宾 (VIP)"),
     ("荣誉", "贵宾 (VIP)"),
     ("honor", "贵宾 (VIP)"),
     ("现充", "贵宾 (VIP)"),
     ("現充", "贵宾 (VIP)"),
     ("发布员", "发布员 (Uploader)"),
+    ("英国短毛猫", "发布员 (Uploader)"),
     ("编辑员", "总版主 (Moderator)"),
     ("助理员", "总版主 (Moderator)"),
     ("总版主", "总版主 (Moderator)"),
+    ("俄罗斯蓝猫", "总版主 (Moderator)"),
     ("管理员", "管理员 (Administrator)"),
     ("维护开发员", "维护开发员 (Sysop)"),
     ("主管", "主管 (Staff Leader)"),
@@ -278,6 +338,8 @@ HIGH_PRIVACY_KEYWORDS = [
     "private profile",
     "you do not have permission",
 ]
+
+LEVEL_LABEL_EXCLUDE_KEYWORDS = ("截止", "日期", "期限", "限时", "限時", "到期")
 
 
 # ----------------------------
@@ -667,6 +729,8 @@ class ParserEngine:
             if not isinstance(text, str):
                 return False
             lower_text = text.strip().lower()
+            if any(ex in lower_text for ex in LEVEL_LABEL_EXCLUDE_KEYWORDS):
+                return False
             return any(k in lower_text for k in keys)
 
         cells = soup.find_all(["td", "th"], string=_match)
@@ -958,9 +1022,17 @@ class ParserEngine:
         if rules.get("level_selector"):
             level_td = soup.select_one(rules["level_selector"])
         if not level_td:
-            level_td = soup.find("td", string=lambda s: isinstance(s, str) and ("等级" in s or "class" in s.lower()))
-            if level_td:
-                level_td = level_td.find_next_sibling("td") or level_td
+            def _is_level_cell(val: Any) -> bool:
+                if not isinstance(val, str):
+                    return False
+                lower_val = val.lower()
+                if not ("等级" in val or "class" in lower_val):
+                    return False
+                return not any(ex in lower_val for ex in LEVEL_LABEL_EXCLUDE_KEYWORDS)
+
+            candidates = soup.find_all("td", string=_is_level_cell)
+            if candidates:
+                level_td = candidates[0].find_next_sibling("td") or candidates[0]
         if level_td:
             img = level_td.find("img", title=True)
             if img and img.get("title"):
@@ -998,6 +1070,7 @@ class ParserEngine:
                 "power": "Power User",
                 "user": "User",
                 "peasant": "Peasant",
+                "vip": "贵宾 (VIP)",
             }
             for img in soup.find_all("img"):
                 cand_text = img.get("title") or img.get("alt") or ""
