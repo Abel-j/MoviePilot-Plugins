@@ -484,11 +484,30 @@ class ConfigManager:
         return None
 
     def update_remote_cache(self, data: Dict[str, Any]):
+        old_site_keys = {s.get("key") or s.get("site_key") for s in self.remote_sites if s}
         self.remote_config_cache = data or {}
+        new_site_keys = {s.get("key") or s.get("site_key") for s in self.remote_sites if s}
         ts = datetime.now().isoformat()
         self.remote_config_ts = ts
         self.plugin.save_data("remote_config_cache", self.remote_config_cache)
         self.plugin.save_data("remote_config_synced_at", ts)
+
+        removed_keys = {k for k in old_site_keys if k and k not in new_site_keys}
+        if removed_keys:
+            cookie_status = self.plugin.get_data("cookie_status") or {}
+            removed = False
+            for key in list(cookie_status.keys()):
+                if key in removed_keys:
+                    cookie_status.pop(key, None)
+                    removed = True
+            if removed:
+                self.plugin.save_data("cookie_status", cookie_status)
+
+            parse_results = self.plugin.get_data("parse_check_results") or []
+            filtered = [r for r in parse_results if (r.get("site_key") not in removed_keys)]
+            if len(filtered) != len(parse_results):
+                self.plugin.save_data("parse_check_results", filtered)
+
         logger.info(
             "审核系统配置已同步：min_user_class=%s, sites=%s, auto_review_enabled=%s",
             self.min_user_class,
@@ -532,6 +551,7 @@ class SiteRegistry:
         self.sites_helper = sites_helper
         self.cookie_status: Dict[str, Dict[str, Any]] = plugin.get_data("cookie_status") or {}
         self.site_mapping: Dict[str, Dict[str, Any]] = {}
+        self._last_refresh_config_ts: Optional[str] = None
 
     def refresh(self):
         local_sites = self.sites_helper.get_indexers() or []
@@ -556,11 +576,12 @@ class SiteRegistry:
                 "has_cookie": bool(local_match and local_match.get("cookie")),
             }
         self.site_mapping = mapping
+        self._last_refresh_config_ts = self.config_mgr.remote_config_ts
 
     def match_site_account(self, site_account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         site_key = site_account.get("site_key") or site_account.get("key")
         url_host = urlparse(site_account.get("url") or "").netloc
-        if not self.site_mapping:
+        if not self.site_mapping or self._last_refresh_config_ts != self.config_mgr.remote_config_ts:
             self.refresh()
         match = self.site_mapping.get(site_key) or self.site_mapping.get(url_host)
         if match:
@@ -1768,7 +1789,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://github.com/Abel-j/MoviePilot-Plugins/blob/main/icons/LuckPT.png"
-    plugin_version = "3.0.3"
+    plugin_version = "3.0.4"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
