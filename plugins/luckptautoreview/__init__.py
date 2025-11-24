@@ -1284,6 +1284,19 @@ class ReviewEngine:
     def _full_url(self, path: str) -> str:
         return f"{self.config_mgr.api_base.rstrip('/')}{path}"
 
+    def _store_heartbeat(self, payload: Dict[str, Any], error: Optional[str] = None):
+        """记录心跳/状态汇报的最新结果并保留已有字段。"""
+        existing = self.plugin.get_data("heartbeat_status") or {}
+        merged = dict(existing)
+        if payload:
+            merged.update({k: v for k, v in payload.items() if v is not None})
+        merged["updated_at"] = datetime.now().isoformat()
+        if error:
+            merged["error"] = error
+        else:
+            merged.pop("error", None)
+        self.plugin.save_data("heartbeat_status", merged)
+
     # --- 上游 API ---
     def sync_remote_config(self):
         logger.debug("开始同步审核系统配置")
@@ -1496,6 +1509,149 @@ class ReviewEngine:
             self._notify_exception(application, f"自动审核异常：{exc}")
         finally:
             logger.info("申请 %s 处理结束", app_id)
+
+    def report_client_status(self):
+        """定期向审核系统汇报本地站点状态。"""
+        if not self.config_mgr.enabled:
+            logger.debug("客户端状态汇报跳过：插件未启用")
+            return
+        if not self.config_mgr.api_token:
+            logger.warning("未配置 API Token，客户端状态汇报停止")
+            return
+        if not self.registry:
+            logger.warning("站点注册表未初始化，跳过状态汇报")
+            return
+        try:
+            self.registry.refresh()
+        except Exception as exc:
+            logger.error("刷新站点映射失败，跳过状态汇报：%s", exc)
+            return
+
+        all_keys = set(self.registry.site_mapping.keys()) | set(self.registry.cookie_status.keys())
+        if not all_keys:
+            logger.debug("客户端状态汇报跳过：无站点数据")
+            return
+
+        now_iso = datetime.now().isoformat()
+        items = []
+        for key in sorted(all_keys):
+            site_info = self.registry.site_mapping.get(key) or {}
+            cache = self.registry.cookie_status.get(key) or {}
+            matched = cache.get("matched")
+            if matched is None:
+                matched = bool(site_info.get("local"))
+            valid = cache.get("valid")
+            reason = (cache.get("reason") or "").strip()
+            if matched is False:
+                status_val = "unmatched"
+                if not reason:
+                    reason = "本地未匹配站点"
+            elif valid is True:
+                status_val = "ok"
+            elif valid is False:
+                status_val = "cookie_invalid"
+                if not reason:
+                    reason = "Cookie 无效"
+            else:
+                status_val = "unknown"
+                if not reason:
+                    reason = "尚未检测"
+            checked_at = cache.get("checked_at") or now_iso
+            if len(reason) > 1000:
+                reason = reason[:1000]
+            items.append(
+                {
+                    "site_key": key,
+                    "status": status_val,
+                    "reason": reason,
+                    "checked_at": checked_at,
+                }
+            )
+
+        payload: Dict[str, Any] = {"items": items}
+        client_version = str(getattr(self.plugin, "plugin_version", "") or "").strip()
+        if client_version:
+            payload["client_version"] = client_version[:64]
+
+        try:
+            res = self._api_client().post_res(self._full_url("/api/v1/site-verifications/client-status"), json=payload)
+        except Exception as exc:
+            self._store_heartbeat({}, error=f"状态汇报请求异常: {exc}")
+            logger.error("客户端状态汇报异常：%s", exc)
+            return
+
+        if not res:
+            self._store_heartbeat({}, error="状态汇报失败: 无响应")
+            logger.error("客户端状态汇报失败：无响应")
+            return
+        if res.status_code != 200:
+            self._store_heartbeat({}, error=f"状态汇报失败: HTTP {res.status_code}")
+            logger.error("客户端状态汇报失败，HTTP 状态码：%s", res.status_code)
+            return
+        try:
+            data = res.json()
+        except Exception as exc:
+            self._store_heartbeat({}, error=f"状态汇报解析失败: {exc}")
+            logger.error("解析客户端状态汇报响应失败: %s", exc)
+            return
+
+        if str(data.get("ret")) == "0":
+            body_data = data.get("data") or {}
+            report_record = {"reported_at": now_iso, "items": items, "response": body_data}
+            self.plugin.save_data("client_status_report", report_record)
+            last_reported = body_data.get("last_reported_at") or now_iso
+            self._store_heartbeat({"last_reported_at": last_reported})
+            logger.info("客户端状态汇报成功，站点数=%s", len(items))
+        else:
+            msg = data.get("msg") or "未知错误"
+            self._store_heartbeat({}, error=f"状态汇报失败: {msg}")
+            logger.error("客户端状态汇报返回错误：%s", msg)
+
+    def send_heartbeat(self):
+        """定期上报心跳并记录在线状态。"""
+        if not self.config_mgr.enabled:
+            logger.debug("心跳跳过：插件未启用")
+            return
+        if not self.config_mgr.api_token:
+            logger.warning("未配置 API Token，心跳停止")
+            return
+        payload: Dict[str, Any] = {}
+        client_version = str(getattr(self.plugin, "plugin_version", "") or "").strip()
+        if client_version:
+            payload["client_version"] = client_version[:64]
+        try:
+            res = self._api_client().post_res(self._full_url("/api/v1/site-verifications/heartbeat"), json=payload)
+        except Exception as exc:
+            self._store_heartbeat({}, error=f"心跳请求异常: {exc}")
+            logger.error("心跳请求异常：%s", exc)
+            return
+
+        if not res:
+            self._store_heartbeat({}, error="心跳失败: 无响应")
+            logger.error("心跳请求无响应")
+            return
+        if res.status_code != 200:
+            self._store_heartbeat({}, error=f"心跳失败: HTTP {res.status_code}")
+            logger.error("心跳请求失败，HTTP 状态码：%s", res.status_code)
+            return
+        try:
+            data = res.json()
+        except Exception as exc:
+            self._store_heartbeat({}, error=f"心跳解析失败: {exc}")
+            logger.error("解析心跳响应失败: %s", exc)
+            return
+
+        if str(data.get("ret")) == "0":
+            hb_data = data.get("data") or {}
+            if hb_data:
+                self._store_heartbeat(hb_data)
+            else:
+                self._store_heartbeat({"last_heartbeat_at": datetime.now().isoformat()})
+            logger.debug("心跳上报成功")
+        else:
+            msg = data.get("msg") or "未知错误"
+            self._store_heartbeat({}, error=f"心跳失败: {msg}")
+            logger.warning("心跳返回错误：%s", msg)
 
     def _run_test_parse(self, url: str):
         """手工测试解析指定链接，仅输出日志。"""
@@ -1788,8 +1944,8 @@ class ReviewEngine:
 class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
-    plugin_icon = "https://github.com/Abel-j/MoviePilot-Plugins/blob/main/icons/LuckPT.png"
-    plugin_version = "3.0.4"
+    plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
+    plugin_version = "3.0.6"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -1853,6 +2009,24 @@ class LuckPTAutoReview(_PluginBase):
             name="Cookie 有效性检测",
         )
         logger.info("已注册Cookie检测任务，间隔=%s分钟", self.config_mgr.cookie_check_interval)
+        # 客户端状态汇报
+        self.scheduler.add_job(
+            self.review_engine.report_client_status,
+            "interval",
+            minutes=5,
+            id="luckpt_client_status",
+            name="客户端状态汇报",
+        )
+        logger.info("已注册客户端状态汇报任务，间隔=5分钟")
+        # 心跳检测
+        self.scheduler.add_job(
+            self.review_engine.send_heartbeat,
+            "interval",
+            minutes=1,
+            id="luckpt_heartbeat",
+            name="心跳检测",
+        )
+        logger.info("已注册心跳任务，间隔=1分钟")
         # 一次性任务
         if self.config_mgr.config.get("run_cookie_check_once"):
             self.scheduler.add_job(
@@ -2393,6 +2567,8 @@ class LuckPTAutoReview(_PluginBase):
         stats = self.get_data("review_health_stats") or {}
         cookie_status = self.get_data("cookie_status") or {}
         parse_results = self.get_data("parse_check_results") or []
+        heartbeat_status = self.get_data("heartbeat_status") or {}
+        client_status_report = self.get_data("client_status_report") or {}
         pending_apps = self._fetch_applications(auto_status="none")
 
         def _fmt_time(value: Any) -> str:
@@ -2452,6 +2628,22 @@ class LuckPTAutoReview(_PluginBase):
         remote_site_count = len(self.config_mgr.remote_sites) if self.config_mgr and self.config_mgr.remote_sites else 0
         config_base_url = self.config_mgr.api_base if self.config_mgr else "-"
         verification_level = self.config_mgr.verification_level if self.config_mgr else "-"
+        hb_online_raw = heartbeat_status.get("online")
+        if isinstance(hb_online_raw, bool):
+            hb_online = hb_online_raw
+        elif isinstance(hb_online_raw, str):
+            hb_online = hb_online_raw.lower() == "true"
+        else:
+            hb_online = None
+        if hb_online is True:
+            hb_state_text, hb_state_color = "在线", "success"
+        elif hb_online is False:
+            hb_state_text, hb_state_color = "离线", "error"
+        else:
+            hb_state_text, hb_state_color = "未知", "grey"
+        hb_last_heartbeat = _fmt_time(heartbeat_status.get("last_heartbeat_at"))
+        hb_last_report = _fmt_time(heartbeat_status.get("last_reported_at") or client_status_report.get("reported_at"))
+        hb_error = heartbeat_status.get("error")
 
         remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
         # 如果本地未缓存站点且有 token，强制拉取一次 config
@@ -2758,6 +2950,13 @@ class LuckPTAutoReview(_PluginBase):
                                         {"component": "div", "text": f"API 地址：{config_base_url}"},
                                         {"component": "div", "text": f"站点配置数：{remote_site_count}"},
                                         {"component": "div", "text": f"验证等级：{verification_level}"},
+                                        {"component": "div", "props": {"class": "d-flex align-center"}, "content": [
+                                            {"component": "span", "text": "在线状态："},
+                                            {"component": "VChip", "props": {"size": "small", "color": hb_state_color, "variant": "flat"}, "text": hb_state_text},
+                                            {"component": "span", "props": {"class": "text-caption text-medium-emphasis ml-2"}, "text": hb_error or ""},
+                                        ]},
+                                        {"component": "div", "text": f"最后心跳：{hb_last_heartbeat}"},
+                                        {"component": "div", "text": f"最后数据汇报：{hb_last_report}"},
                                         {"component": "div", "text": f"最后配置同步：{last_config_synced}"},
                                         {"component": "div", "text": f"最后审核时间：{last_log_ts}"},
                                     ]},
