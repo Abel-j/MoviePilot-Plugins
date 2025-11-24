@@ -342,6 +342,13 @@ HIGH_PRIVACY_KEYWORDS = [
 LEVEL_LABEL_EXCLUDE_KEYWORDS = ("截止", "日期", "期限", "限时", "限時", "到期")
 
 
+def _sanitize_cookie_string(cookie: Optional[str]) -> str:
+    """移除 Cookie 中的换行等无效字符，避免构造请求头时报错。"""
+    if not cookie:
+        return ""
+    return re.sub(r"[\r\n]+", "; ", str(cookie)).strip()
+
+
 # ----------------------------
 # 配置管理
 # ----------------------------
@@ -580,7 +587,7 @@ class SiteRegistry:
         if not site.get("local"):
             result["reason"] = "本地未配置站点"
             return result
-        cookie = site["local"].get("cookie")
+        cookie = _sanitize_cookie_string(site["local"].get("cookie"))
         ua = site["local"].get("ua") or settings.USER_AGENT
         base_url = (site.get("remote") or {}).get("url") or site["local"].get("url")
         if not cookie or not base_url:
@@ -1532,7 +1539,7 @@ class ReviewEngine:
 
         match = self.registry.match_site_account(account) or {}
         local_site = match.get("local") or {}
-        cookie = local_site.get("cookie")
+        cookie = _sanitize_cookie_string(local_site.get("cookie"))
         ua = local_site.get("ua") or settings.USER_AGENT
         logger.debug("开始解析站点 %s，验证链接=%s", site_key, verification_url)
         result = {
@@ -1761,7 +1768,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://github.com/Abel-j/MoviePilot-Plugins/blob/main/icons/LuckPT.png"
-    plugin_version = "3.0.2"
+    plugin_version = "3.0.3"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -1900,8 +1907,9 @@ class LuckPTAutoReview(_PluginBase):
                 logger.debug("解析检测跳过：站点=%s 缺少 URL", key)
                 return None
             try:
+                cookie_val = _sanitize_cookie_string(site["local"].get("cookie"))
                 req = RequestUtils(
-                    headers={"Cookie": site["local"].get("cookie"), "User-Agent": site["local"].get("ua")},
+                    headers={"Cookie": cookie_val, "User-Agent": site["local"].get("ua")},
                     timeout=30,
                 )
                 res = _fetch_with_retry(req, base_url, attempts=5)
