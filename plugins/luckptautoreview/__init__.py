@@ -577,6 +577,25 @@ class SiteRegistry:
             }
         self.site_mapping = mapping
         self._last_refresh_config_ts = self.config_mgr.remote_config_ts
+        self._prune_stale_data()
+
+    def _prune_stale_data(self):
+        """
+        移除已不存在的站点缓存，避免远端删除站点后仍然出现在本地。
+        """
+        active_keys = set(self.site_mapping.keys())
+        stale_cookie_keys = [k for k in list(self.cookie_status.keys()) if k not in active_keys]
+        if stale_cookie_keys:
+            for key in stale_cookie_keys:
+                self.cookie_status.pop(key, None)
+            self.plugin.save_data("cookie_status", self.cookie_status)
+            logger.info("已清理过期的 Cookie 状态缓存：%s", ",".join(stale_cookie_keys))
+
+        parse_results = self.plugin.get_data("parse_check_results") or []
+        filtered = [r for r in parse_results if r.get("site_key") in active_keys]
+        if len(filtered) != len(parse_results):
+            self.plugin.save_data("parse_check_results", filtered)
+            logger.info("已清理过期的解析检测结果，移除 %s 条", len(parse_results) - len(filtered))
 
     def match_site_account(self, site_account: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         site_key = site_account.get("site_key") or site_account.get("key")
@@ -1527,14 +1546,14 @@ class ReviewEngine:
             logger.error("刷新站点映射失败，跳过状态汇报：%s", exc)
             return
 
-        all_keys = set(self.registry.site_mapping.keys()) | set(self.registry.cookie_status.keys())
-        if not all_keys:
+        active_keys = set(self.registry.site_mapping.keys())
+        if not active_keys:
             logger.debug("客户端状态汇报跳过：无站点数据")
             return
 
         now_iso = datetime.now().isoformat()
         items = []
-        for key in sorted(all_keys):
+        for key in sorted(active_keys):
             site_info = self.registry.site_mapping.get(key) or {}
             cache = self.registry.cookie_status.get(key) or {}
             matched = cache.get("matched")
@@ -1945,7 +1964,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.0.6"
+    plugin_version = "3.0.7"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -2563,6 +2582,11 @@ class LuckPTAutoReview(_PluginBase):
                 self.review_engine.fetch_logs()
             except Exception as exc:
                 logger.warning("页面加载时拉取审核日志失败：%s", exc)
+        if self.registry:
+            try:
+                self.registry.refresh()
+            except Exception as exc:
+                logger.warning("页面加载时刷新站点映射失败：%s", exc)
         logs = self.get_data("review_logs") or []
         stats = self.get_data("review_health_stats") or {}
         cookie_status = self.get_data("cookie_status") or {}
@@ -2650,9 +2674,8 @@ class LuckPTAutoReview(_PluginBase):
         if not remote_sites and self.review_engine and self.config_mgr and self.config_mgr.api_token:
             self.review_engine.sync_remote_config()
             remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
-        all_site_keys = {s.get("key") or s.get("site_key") for s in remote_sites if s.get("key") or s.get("site_key")}
-        all_site_keys.update(cookie_status.keys())
-        all_site_keys.update([p.get("site_key") for p in parse_results if p.get("site_key")])
+        remote_keys = {s.get("key") or s.get("site_key") for s in remote_sites if s.get("key") or s.get("site_key")}
+        all_site_keys = set(remote_keys)
 
         # --- 构造 Cookie 卡片数据 ---
         cookie_cards: List[Dict[str, Any]] = []

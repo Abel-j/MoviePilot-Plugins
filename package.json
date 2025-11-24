@@ -3,7 +3,7 @@
     "name": "LuckPT自动审核",
     "description": "LuckPT管理组定制专用",
     "labels": "站点,LuckPT,自动审核",
-    "version": "3.0.6",
+    "version": "3.0.7",
     "icon": "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png",
     "author": "LuckPT",
     "level": 2,
