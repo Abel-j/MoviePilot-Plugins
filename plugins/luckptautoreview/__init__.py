@@ -1546,44 +1546,86 @@ class ReviewEngine:
             logger.error("刷新站点映射失败，跳过状态汇报：%s", exc)
             return
 
-        active_keys = set(self.registry.site_mapping.keys())
-        if not active_keys:
+        parse_results = self.plugin.get_data("parse_check_results") or []
+        parse_map = {item.get("site_key"): item for item in parse_results if item.get("site_key")}
+
+        all_keys = (
+            set(self.registry.site_mapping.keys())
+            | set(self.registry.cookie_status.keys())
+            | set(parse_map.keys())
+        )
+        if not all_keys:
             logger.debug("客户端状态汇报跳过：无站点数据")
             return
 
         now_iso = datetime.now().isoformat()
         items = []
-        for key in sorted(active_keys):
+        for key in sorted(all_keys):
             site_info = self.registry.site_mapping.get(key) or {}
-            cache = self.registry.cookie_status.get(key) or {}
-            matched = cache.get("matched")
+            cookie_cache = self.registry.cookie_status.get(key) or {}
+            parse_cache = parse_map.get(key) or {}
+            matched = cookie_cache.get("matched")
             if matched is None:
                 matched = bool(site_info.get("local"))
-            valid = cache.get("valid")
-            reason = (cache.get("reason") or "").strip()
+            valid = cookie_cache.get("valid")
+            cookie_reason = (cookie_cache.get("reason") or "").strip()
+            parse_reason = (parse_cache.get("reason") or "").strip()
             if matched is False:
-                status_val = "unmatched"
-                if not reason:
-                    reason = "本地未匹配站点"
+                cookie_status_val = "unmatched"
+                if not cookie_reason:
+                    cookie_reason = "本地未匹配站点"
             elif valid is True:
-                status_val = "ok"
+                cookie_status_val = "ok"
             elif valid is False:
-                status_val = "cookie_invalid"
-                if not reason:
-                    reason = "Cookie 无效"
+                cookie_status_val = "cookie_invalid"
+                if not cookie_reason:
+                    cookie_reason = "Cookie 无效"
             else:
-                status_val = "unknown"
-                if not reason:
-                    reason = "尚未检测"
-            checked_at = cache.get("checked_at") or now_iso
+                cookie_status_val = "unknown"
+                if not cookie_reason:
+                    cookie_reason = "尚未检测"
+
+            raw_parse_status = (parse_cache.get("status") or "").lower()
+            if raw_parse_status == "failed":
+                parse_status_val = "failed"
+            elif raw_parse_status in ("success", "partial"):
+                parse_status_val = "ok"
+            else:
+                parse_status_val = "unknown"
+
+            checked_at_candidates = [
+                parse_cache.get("checked_at"),
+                cookie_cache.get("checked_at"),
+                now_iso,
+            ]
+            checked_at = next((ts for ts in checked_at_candidates if ts), now_iso)
+
+            reasons = []
+            if cookie_reason:
+                reasons.append(f"Cookie: {cookie_reason}")
+            if parse_reason and parse_status_val != "unknown":
+                reasons.append(f"解析: {parse_reason}")
+            if not reasons and cookie_status_val == "unknown" and parse_status_val == "unknown":
+                reasons.append("尚未检测")
+            reason = "；".join(reasons)
             if len(reason) > 1000:
                 reason = reason[:1000]
+
+            status_detail = {
+                "cookie": cookie_status_val,
+                "parse": parse_status_val,
+            }
+            if cookie_status_val in ("unknown", "unmatched"):
+                status_detail["other"] = cookie_status_val
             items.append(
                 {
                     "site_key": key,
-                    "status": status_val,
+                    "status": cookie_status_val,
                     "reason": reason,
                     "checked_at": checked_at,
+                    "cookie_status": cookie_status_val,
+                    "parse_status": parse_status_val,
+                    "status_detail": status_detail,
                 }
             )
 
@@ -1964,7 +2006,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.0.7"
+    plugin_version = "3.0.8"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -2028,6 +2070,15 @@ class LuckPTAutoReview(_PluginBase):
             name="Cookie 有效性检测",
         )
         logger.info("已注册Cookie检测任务，间隔=%s分钟", self.config_mgr.cookie_check_interval)
+        # 解析检测
+        self.scheduler.add_job(
+            self._parse_check_task,
+            "interval",
+            minutes=self.config_mgr.cookie_check_interval,
+            id="luckpt_parse_check",
+            name="解析检测",
+        )
+        logger.info("已注册解析检测任务，间隔=%s分钟", self.config_mgr.cookie_check_interval)
         # 客户端状态汇报
         self.scheduler.add_job(
             self.review_engine.report_client_status,
