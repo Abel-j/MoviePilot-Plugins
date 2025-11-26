@@ -331,6 +331,21 @@ LEVEL_KEYWORDS: List[Tuple[str, str]] = [
     ("user", "User"),
 ]
 
+# 通过等级图标文件名推断的映射
+SRC_LEVEL_MAP = {
+    "nexus": "Nexus Master",
+    "ultimate": "Ultimate User",
+    "extreme": "Extreme User",
+    "veteran": "Veteran User",
+    "insane": "Insane User",
+    "crazy": "Crazy User",
+    "elite": "Elite User",
+    "power": "Power User",
+    "user": "User",
+    "peasant": "Peasant",
+    "vip": "贵宾 (VIP)",
+}
+
 HIGH_PRIVACY_KEYWORDS = [
     "访问被用户",
     "保护其隐私",
@@ -736,6 +751,40 @@ class SiteRegistry:
         except Exception as exc:
             logger.error("发送 Cookie 失效通知失败: %s", exc)
 
+    def retry_failed_cookies(self) -> List[Dict[str, Any]]:
+        """
+        对已检测为失效的 Cookie 进行快速重试，周期性触发，避免卡在偶发网络波动。
+        仅针对已匹配站点且 valid=False 的记录。
+        """
+        self.refresh()
+        targets = [k for k, v in (self.cookie_status or {}).items() if v and v.get("matched") and not v.get("valid")]
+        if not targets:
+            return []
+        reports: List[Dict[str, Any]] = []
+        logger.info("开始失败 Cookie 重试，站点数=%s", len(targets))
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {executor.submit(self._check_cookie_with_retry, key, self.site_mapping.get(key) or {}): key for key in targets}
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    logger.error("Cookie重试并发任务异常：站点=%s 错误=%s", key, exc)
+                    status = {
+                        "site_key": key,
+                        "site_name": key,
+                        "valid": False,
+                        "matched": False,
+                        "reason": f"并发重试异常: {exc}",
+                        "checked_at": datetime.now().isoformat(),
+                    }
+                self.update_cookie_status(key, status)
+                reports.append(status)
+        recovered = len([r for r in reports if r.get("valid")])
+        still_bad = len([r for r in reports if not r.get("valid") and r.get("matched")])
+        logger.info("失败 Cookie 重试结束：恢复=%s 仍失效=%s 总计=%s", recovered, still_bad, len(reports))
+        return reports
+
 
 # ----------------------------
 # 解析引擎
@@ -792,6 +841,11 @@ class ParserEngine:
                             return cleaned
             sibling = cell.find_next_sibling(["td", "th"])
             if sibling:
+                img = sibling.find("img", title=True) or sibling.find("img", alt=True)
+                if img and (img.get("title") or img.get("alt")):
+                    candidate = self._clean_text(img.get("title") or img.get("alt"))
+                    if candidate:
+                        return candidate
                 candidate = self._clean_text(sibling.get_text(" ", strip=True))
                 if candidate:
                     return candidate
@@ -799,9 +853,14 @@ class ParserEngine:
             if parent:
                 siblings = [c for c in parent.find_all(["td", "th"]) if c is not cell]
                 for sib in siblings:
-                        candidate = self._clean_text(sib.get_text(" ", strip=True))
+                    img = sib.find("img", title=True) or sib.find("img", alt=True)
+                    if img and (img.get("title") or img.get("alt")):
+                        candidate = self._clean_text(img.get("title") or img.get("alt"))
                         if candidate:
                             return candidate
+                    candidate = self._clean_text(sib.get_text(" ", strip=True))
+                    if candidate:
+                        return candidate
         return None
 
     def _extract_label_map(self, soup: BeautifulSoup) -> Dict[str, str]:
@@ -926,6 +985,30 @@ class ParserEngine:
         base_url_l = (base_url or "").lower()
         is_open_cd = site_key_l in ("opencd", "open.cd", "open_cd") or "open.cd" in base_url_l
 
+        def _pick_level_from_imgs(imgs) -> Optional[str]:
+            """根据图片的 title/alt/src/class 提取等级。"""
+            for img in imgs or []:
+                title_or_alt = self._clean_text((img.get("title") or img.get("alt") or ""))
+                if title_or_alt:
+                    title_l = title_or_alt.lower()
+                    if title_l in DEFAULT_LEVEL_ALIASES:
+                        return DEFAULT_LEVEL_ALIASES[title_l]
+                    matched = self._match_level_by_keywords(title_or_alt)
+                    if matched:
+                        return matched
+                    if title_or_alt in LEVEL_ORDER:
+                        return title_or_alt
+                src = img.get("src") or ""
+                fname = urlparse(src).path.lower()
+                for key, val in SRC_LEVEL_MAP.items():
+                    if key in fname:
+                        return val
+                cls = " ".join(img.get("class") or [])
+                if cls:
+                    cls_match = self._match_level_by_keywords(cls)
+                    if cls_match:
+                        return cls_match
+            return None
 
         # 用户名解析：优先自定义选择器/正则
         if rules.get("username_selector"):
@@ -1066,6 +1149,8 @@ class ParserEngine:
 
         # 等级解析
         level_td = None
+        level_text_candidate = None
+        level_cell_has_img = False
         if rules.get("level_selector"):
             level_td = soup.select_one(rules["level_selector"])
         if not level_td:
@@ -1081,13 +1166,22 @@ class ParserEngine:
             if candidates:
                 level_td = candidates[0].find_next_sibling("td") or candidates[0]
         if level_td:
-            img = level_td.find("img", title=True)
-            if img and img.get("title"):
-                level_raw = img["title"].strip()
-            else:
-                text = level_td.get_text(strip=True)
+            imgs = level_td.find_all("img")
+            if imgs:
+                level_cell_has_img = True
+            level_from_imgs = _pick_level_from_imgs(imgs)
+            if level_from_imgs:
+                level_raw = level_from_imgs
+            if not level_raw:
+                text = level_td.get_text(" ", strip=True)
                 if text:
-                    level_raw = text
+                    text_cleaned = self._clean_text(text)
+                    # 仅在文本含有等级关键词时直接作为等级，否则暂存为候选，避免误判为个人称号
+                    if self._match_level_by_keywords(text_cleaned) or text_cleaned.lower() in DEFAULT_LEVEL_ALIASES:
+                        level_raw = text_cleaned
+                    elif not level_cell_has_img:
+                        # 仅在单元格没有等级图标时，才把纯文本当作候选，避免把个性签名当成等级
+                        level_text_candidate = text_cleaned
         if not level_raw and rules.get("level_regex"):
             m = re.search(rules["level_regex"], html or "", re.IGNORECASE)
             if m:
@@ -1106,35 +1200,11 @@ class ParserEngine:
                     break
         # 兜底：扫描页面内所有等级图标
         if not level_raw:
-            src_level_map = {
-                "nexus": "Nexus Master",
-                "ultimate": "Ultimate User",
-                "extreme": "Extreme User",
-                "veteran": "Veteran User",
-                "insane": "Insane User",
-                "crazy": "Crazy User",
-                "elite": "Elite User",
-                "power": "Power User",
-                "user": "User",
-                "peasant": "Peasant",
-                "vip": "贵宾 (VIP)",
-            }
-            for img in soup.find_all("img"):
-                cand_text = img.get("title") or img.get("alt") or ""
-                cand_text = self._clean_text(cand_text)
-                if cand_text:
-                    fuzzy = self._match_level_by_keywords(cand_text)
-                    if fuzzy:
-                        level_raw = cand_text
-                        break
-                src = img.get("src") or ""
-                fname = urlparse(src).path.lower()
-                for key, val in src_level_map.items():
-                    if key in fname:
-                        level_raw = val
-                        break
-                if level_raw:
-                    break
+            level_from_imgs = _pick_level_from_imgs(soup.find_all("img"))
+            if level_from_imgs:
+                level_raw = level_from_imgs
+        if not level_raw and level_text_candidate:
+            level_raw = level_text_candidate
         if level_raw:
             level_raw = self._clean_text(level_raw)
 
@@ -1216,6 +1286,14 @@ class ParserEngine:
 
         # 标准化等级（支持自定义映射）
         level_standard, level_index = self.normalize_level(level_raw, level_alias_source)
+        # 若已识别到的等级无法标准化，再尝试从等级单元格/全局图片重取一次，避免把个人称号当等级
+        if level_raw and level_index is None:
+            img_level = _pick_level_from_imgs(level_td.find_all("img")) if level_td else None
+            if not img_level:
+                img_level = _pick_level_from_imgs(soup.find_all("img"))
+            if img_level:
+                level_raw = img_level
+                level_standard, level_index = self.normalize_level(level_raw, level_alias_source)
 
         privacy = self.detect_privacy(html, email, username)
         return {
@@ -1633,6 +1711,14 @@ class ReviewEngine:
         client_version = str(getattr(self.plugin, "plugin_version", "") or "").strip()
         if client_version:
             payload["client_version"] = client_version[:64]
+        # 附带本地配置（去除敏感 Token），便于审核端了解客户端参数
+        safe_config = {}
+        try:
+            safe_config = {k: v for k, v in (self.config_mgr.config or {}).items() if k not in ("api_token",)}
+        except Exception:
+            safe_config = {}
+        if safe_config:
+            payload["client_config"] = safe_config
 
         try:
             res = self._api_client().post_res(self._full_url("/api/v1/site-verifications/client-status"), json=payload)
@@ -2006,7 +2092,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.0.8"
+    plugin_version = "3.0.9"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -2042,6 +2128,19 @@ class LuckPTAutoReview(_PluginBase):
         if not self.config_mgr.enabled:
             logger.warning("插件配置 disabled，跳过任务调度与定时启动")
             return
+
+        # 首次安装启用后，自动执行一次 Cookie 检测与解析检测
+        if not self.get_data("first_run_completed"):
+            try:
+                logger.info("首次启用，自动执行 Cookie 与解析检测")
+                self.review_engine.sync_remote_config()
+                self.registry.refresh()
+                self.registry.run_cookie_check()
+                self._parse_check_task()
+            except Exception as exc:
+                logger.error("首次启用自动检测失败：%s", exc)
+            finally:
+                self.save_data("first_run_completed", True)
 
         self.scheduler = BackgroundScheduler(timezone=settings.TZ)
         # 自动审核
@@ -2079,6 +2178,15 @@ class LuckPTAutoReview(_PluginBase):
             name="解析检测",
         )
         logger.info("已注册解析检测任务，间隔=%s分钟", self.config_mgr.cookie_check_interval)
+        # 失败重试（Cookie 失效 & 解析失败）
+        self.scheduler.add_job(
+            self._retry_failed_checks,
+            "interval",
+            minutes=10,
+            id="luckpt_retry_failed",
+            name="失败重试",
+        )
+        logger.info("已注册失败重试任务，间隔=10分钟")
         # 客户端状态汇报
         self.scheduler.add_job(
             self.review_engine.report_client_status,
@@ -2147,6 +2255,196 @@ class LuckPTAutoReview(_PluginBase):
 
         return inner
 
+    @staticmethod
+    def _fetch_with_retry(req: RequestUtils, url: str, attempts: int = 5, delay: float = 1.0) -> Optional[Any]:
+        """统一的带重试 GET 请求。"""
+        for idx in range(attempts):
+            res = req.get_res(url, allow_redirects=True, verify=False)
+            if res and res.status_code == 200:
+                return res
+            time.sleep(delay)
+        return None
+
+    def _parse_check_one(self, key: str, site: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """单站点解析检测，供全量检测与失败重试复用。"""
+        if not site.get("local") or not site.get("local", {}).get("cookie"):
+            logger.debug("解析检测跳过：站点=%s 缺少本地配置或 Cookie", key)
+            return None
+        base_url = (site.get("remote") or {}).get("url") or site.get("local", {}).get("url")
+        if not base_url:
+            logger.debug("解析检测跳过：站点=%s 缺少 URL", key)
+            return None
+        try:
+            cookie_val = _sanitize_cookie_string(site["local"].get("cookie"))
+            req = RequestUtils(
+                headers={"Cookie": cookie_val, "User-Agent": site["local"].get("ua")},
+                timeout=30,
+            )
+            res = self._fetch_with_retry(req, base_url, attempts=5)
+            if not res or res.status_code != 200:
+                logger.debug(
+                    "解析检测失败：站点=%s HTTP=%s",
+                    key,
+                    res.status_code if res else "无响应",
+                )
+                return {
+                    "site_key": key,
+                    "site_name": (site.get("remote") or {}).get("name") or key,
+                    "status": "failed",
+                    "reason": f"访问失败 {res.status_code if res else '无响应'}",
+                    "checked_at": datetime.now().isoformat(),
+                }
+            parsed = self.parser.parse_page(
+                res.text,
+                site_key=key,
+                overrides={
+                    **self.config_mgr.parse_rule(key),
+                    "level_aliases": self.config_mgr.level_aliases(key),
+                    "base_url": base_url,
+                },
+                strip_nav=False,
+            )
+            if (not parsed.get("email") or not parsed.get("level_standard")):
+                profile_url = parsed.get("profile_url")
+                if not profile_url:
+                    cookie_str = site.get("local", {}).get("cookie") or ""
+                    m_uid = re.search(r"(?:uid|c_secure_uid)=([0-9]+)", cookie_str, re.IGNORECASE)
+                    if m_uid and base_url:
+                        profile_url = urljoin(base_url, f"/userdetails.php?id={m_uid.group(1)}")
+                if profile_url:
+                    logger.debug("解析检测二次解析个人主页：站点=%s url=%s", key, profile_url)
+                    res_profile = self._fetch_with_retry(req, profile_url, attempts=5)
+                    if res_profile and res_profile.status_code == 200:
+                        parsed_profile = self.parser.parse_page(
+                            res_profile.text,
+                            site_key=key,
+                            overrides={
+                                **self.config_mgr.parse_rule(key),
+                                "level_aliases": self.config_mgr.level_aliases(key),
+                                "base_url": profile_url,
+                            },
+                            strip_nav=False,
+                        )
+                        for k in (
+                            "username",
+                            "email",
+                            "level_raw",
+                            "level_standard",
+                            "level_index",
+                            "privacy_level",
+                            "register_time",
+                        ):
+                            if parsed_profile.get(k):
+                                parsed[k] = parsed_profile[k]
+            has_username = bool(parsed.get("username"))
+            has_email = bool(parsed.get("email"))
+            has_level = bool(parsed.get("level_standard") or parsed.get("level_raw"))
+            has_standard_level = bool(parsed.get("level_standard"))
+            has_register = bool(parsed.get("register_time"))
+            missing_fields = []
+            if not has_email:
+                missing_fields.append("邮箱")
+            if not has_level:
+                missing_fields.append("等级")
+            elif not has_standard_level:
+                missing_fields.append("标准等级")
+            if not has_register:
+                missing_fields.append("注册时间")
+            if not has_username:
+                status_val = "failed"
+                reason_text = "缺少用户名"
+            elif missing_fields:
+                status_val = "partial"
+                reason_text = f"缺少信息：{'/'.join(missing_fields)}"
+            else:
+                status_val = "success"
+                reason_text = None
+            logger.debug(
+                "解析检测完成：站点=%s 状态=%s 用户=%s 邮箱=%s 等级=%s 注册时间=%s",
+                key,
+                status_val,
+                parsed.get("username"),
+                parsed.get("email"),
+                parsed.get("level_standard") or parsed.get("level_raw"),
+                parsed.get("register_time"),
+            )
+            return {
+                "site_key": key,
+                "site_name": (site.get("remote") or {}).get("name") or key,
+                "status": status_val,
+                "username": parsed.get("username"),
+                "email": parsed.get("email"),
+                "level": parsed.get("level_standard") or parsed.get("level_raw"),
+                "register_time": parsed.get("register_time"),
+                "checked_at": datetime.now().isoformat(),
+                "privacy_level": parsed.get("privacy_level"),
+                "reason": reason_text,
+            }
+        except Exception as exc:
+            logger.error("解析检测异常：站点=%s 错误=%s", key, exc)
+            return {
+                "site_key": key,
+                "site_name": (site.get("remote") or {}).get("name") or key,
+                "status": "failed",
+                "reason": f"解析异常: {exc}",
+                "checked_at": datetime.now().isoformat(),
+            }
+
+    def _retry_failed_parse(self) -> List[Dict[str, Any]]:
+        """
+        对解析失败的站点（status=failed）按 10 分钟节奏进行补偿重试。
+        存疑/partial 视为正常，不参与重试。
+        """
+        if not self.registry or not self.parser:
+            return []
+        self.registry.refresh()
+        existing = self.get_data("parse_check_results") or []
+        mapping = {r.get("site_key"): r for r in existing if r.get("site_key")}
+        targets = [k for k, v in mapping.items() if v.get("status") == "failed"]
+        if not targets:
+            return []
+        logger.info("开始解析失败重试，站点数=%s", len(targets))
+        updates: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_map = {
+                executor.submit(self._parse_check_one, key, self.registry.site_mapping.get(key) or {}): key
+                for key in targets
+            }
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    logger.error("解析重试并发任务异常：站点=%s 错误=%s", key, exc)
+                    res = {
+                        "site_key": key,
+                        "site_name": key,
+                        "status": "failed",
+                        "reason": f"并发重试异常: {exc}",
+                        "checked_at": datetime.now().isoformat(),
+                    }
+                if res:
+                    mapping[key] = res
+                    updates.append(res)
+        self.save_data("parse_check_results", list(mapping.values()))
+        recovered = len([r for r in updates if r.get("status") == "success"])
+        still_failed = len([r for r in updates if r.get("status") != "success"])
+        logger.info("解析失败重试结束：恢复=%s 仍失败=%s 总计=%s", recovered, still_failed, len(updates))
+        return updates
+
+    def _retry_failed_checks(self):
+        """按 10 分钟重试失败的 Cookie 与解析检测。"""
+        cookie_res = self.registry.retry_failed_cookies() if self.registry else []
+        parse_res = self._retry_failed_parse()
+        if not cookie_res and not parse_res:
+            logger.debug("失败重试任务：无需要重试的站点")
+        else:
+            logger.info(
+                "失败重试任务完成：Cookie=%s 条，解析=%s 条",
+                len(cookie_res),
+                len(parse_res),
+            )
+
     def _parse_check_task(self):
         if not self.registry or not self.parser:
             return
@@ -2154,145 +2452,23 @@ class LuckPTAutoReview(_PluginBase):
         results: List[Dict[str, Any]] = []
         logger.info("开始解析检测，站点数=%s", len(self.registry.site_mapping))
 
-        def _fetch_with_retry(req: RequestUtils, url: str, attempts: int = 5) -> Optional[Any]:
-            """统一的带重试 GET 请求。"""
-            for idx in range(attempts):
-                res = req.get_res(url, allow_redirects=True, verify=False)
-                if res and res.status_code == 200:
-                    return res
-                time.sleep(1)
-            return None
-
-        def _process_site(key: str, site: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if not site.get("local") or not site.get("local", {}).get("cookie"):
-                logger.debug("解析检测跳过：站点=%s 缺少本地配置或 Cookie", key)
-                return None
-            base_url = (site.get("remote") or {}).get("url") or site.get("local", {}).get("url")
-            if not base_url:
-                logger.debug("解析检测跳过：站点=%s 缺少 URL", key)
-                return None
-            try:
-                cookie_val = _sanitize_cookie_string(site["local"].get("cookie"))
-                req = RequestUtils(
-                    headers={"Cookie": cookie_val, "User-Agent": site["local"].get("ua")},
-                    timeout=30,
-                )
-                res = _fetch_with_retry(req, base_url, attempts=5)
-                if not res or res.status_code != 200:
-                    logger.debug(
-                        "解析检测失败：站点=%s HTTP=%s",
-                        key,
-                        res.status_code if res else "无响应",
-                    )
-                    return {
-                        "site_key": key,
-                        "site_name": (site.get("remote") or {}).get("name") or key,
-                        "status": "failed",
-                        "reason": f"访问失败 {res.status_code if res else '无响应'}",
-                        "checked_at": datetime.now().isoformat(),
-                    }
-                parsed = self.parser.parse_page(
-                    res.text,
-                    site_key=key,
-                    overrides={
-                        **self.config_mgr.parse_rule(key),
-                        "level_aliases": self.config_mgr.level_aliases(key),
-                        "base_url": base_url,
-                    },
-                    strip_nav=False,
-                )
-                if (not parsed.get("email") or not parsed.get("level_standard")):
-                    profile_url = parsed.get("profile_url")
-                    if not profile_url:
-                        cookie_str = site.get("local", {}).get("cookie") or ""
-                        m_uid = re.search(r"(?:uid|c_secure_uid)=([0-9]+)", cookie_str, re.IGNORECASE)
-                        if m_uid and base_url:
-                            profile_url = urljoin(base_url, f"/userdetails.php?id={m_uid.group(1)}")
-                    if profile_url:
-                        logger.debug("解析检测二次解析个人主页：站点=%s url=%s", key, profile_url)
-                        res_profile = _fetch_with_retry(req, profile_url, attempts=5)
-                        if res_profile and res_profile.status_code == 200:
-                            parsed_profile = self.parser.parse_page(
-                                res_profile.text,
-                                site_key=key,
-                                overrides={
-                                    **self.config_mgr.parse_rule(key),
-                                    "level_aliases": self.config_mgr.level_aliases(key),
-                                    "base_url": profile_url,
-                                },
-                                strip_nav=False,
-                            )
-                            for k in (
-                                "username",
-                                "email",
-                                "level_raw",
-                                "level_standard",
-                                "level_index",
-                                "privacy_level",
-                                "register_time",
-                            ):
-                                if parsed_profile.get(k):
-                                    parsed[k] = parsed_profile[k]
-                has_username = bool(parsed.get("username"))
-                has_email = bool(parsed.get("email"))
-                has_level = bool(parsed.get("level_standard") or parsed.get("level_raw"))
-                has_standard_level = bool(parsed.get("level_standard"))
-                has_register = bool(parsed.get("register_time"))
-                missing_fields = []
-                if not has_email:
-                    missing_fields.append("邮箱")
-                if not has_level:
-                    missing_fields.append("等级")
-                elif not has_standard_level:
-                    missing_fields.append("标准等级")
-                if not has_register:
-                    missing_fields.append("注册时间")
-                if not has_username:
-                    status_val = "failed"
-                    reason_text = "缺少用户名"
-                elif missing_fields:
-                    status_val = "partial"
-                    reason_text = f"缺少信息：{'/'.join(missing_fields)}"
-                else:
-                    status_val = "success"
-                    reason_text = None
-                logger.debug(
-                    "解析检测完成：站点=%s 状态=%s 用户=%s 邮箱=%s 等级=%s 注册时间=%s",
-                    key,
-                    status_val,
-                    parsed.get("username"),
-                    parsed.get("email"),
-                    parsed.get("level_standard") or parsed.get("level_raw"),
-                    parsed.get("register_time"),
-                )
-                return {
-                    "site_key": key,
-                    "site_name": (site.get("remote") or {}).get("name") or key,
-                    "status": status_val,
-                    "username": parsed.get("username"),
-                    "email": parsed.get("email"),
-                    "level": parsed.get("level_standard") or parsed.get("level_raw"),
-                    "register_time": parsed.get("register_time"),
-                    "checked_at": datetime.now().isoformat(),
-                    "privacy_level": parsed.get("privacy_level"),
-                    "reason": reason_text,
-                }
-            except Exception as exc:
-                logger.error("解析检测异常：站点=%s 错误=%s", key, exc)
-                return {
-                    "site_key": key,
-                    "site_name": (site.get("remote") or {}).get("name") or key,
-                    "status": "failed",
-                    "reason": f"解析异常: {exc}",
-                    "checked_at": datetime.now().isoformat(),
-                }
-
         with ThreadPoolExecutor(max_workers=8) as executor:
             future_to_key = {
-                executor.submit(_process_site, key, site): key for key, site in self.registry.site_mapping.items()
+                executor.submit(self._parse_check_one, key, site): key for key, site in self.registry.site_mapping.items()
             }
             for future in as_completed(future_to_key):
-                res = future.result()
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    key = future_to_key[future]
+                    logger.error("解析检测并发任务异常：站点=%s 错误=%s", key, exc)
+                    res = {
+                        "site_key": key,
+                        "site_name": key,
+                        "status": "failed",
+                        "reason": f"并发异常: {exc}",
+                        "checked_at": datetime.now().isoformat(),
+                    }
                 if res:
                     results.append(res)
         self.save_data("parse_check_results", results)
