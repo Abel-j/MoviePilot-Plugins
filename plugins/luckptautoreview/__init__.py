@@ -364,6 +364,28 @@ def _sanitize_cookie_string(cookie: Optional[str]) -> str:
     return re.sub(r"[\r\n]+", "; ", str(cookie)).strip()
 
 
+def _is_normal_homepage_html(html: str, content_type: str = "") -> bool:
+    """
+    粗略判断返回内容是否为正常的首页 HTML 页面。
+    要求具备 HTML/Body 结构，排除常见拦截页。
+    """
+    if not html:
+        return False
+    ct = (content_type or "").lower()
+    if ct and "html" not in ct:
+        return False
+    lower_html = html.lower()
+    if "<html" not in lower_html or "<body" not in lower_html:
+        return False
+    if any(block in lower_html for block in ("just a moment", "attention required", "access denied", "captcha")):
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    if not soup or not soup.find("html") or not soup.find("body"):
+        return False
+    text_len = len((soup.get_text() or "").strip())
+    return text_len > 30
+
+
 # ----------------------------
 # 配置管理
 # ----------------------------
@@ -374,6 +396,7 @@ class ConfigManager:
         "enabled": False,
         "api_token": "",
         "review_cron": "*/5 * * * *",
+        "daily_report_cron": "0 23 * * *",
         "config_sync_interval_minutes": 10,
         "log_refresh_interval_minutes": 10,
         "run_cookie_check_once": False,
@@ -382,7 +405,6 @@ class ConfigManager:
         "notify_review_result": True,
         "notify_exception": True,
         "notify_pending": True,
-        "notify_cookie_invalid": True,
         "status_retry_count": 3,
         "status_retry_interval_seconds": 30,
         "api_base_url": "https://pt.luckpt.de",
@@ -430,6 +452,14 @@ class ConfigManager:
     @property
     def review_cron(self) -> str:
         return self.config.get("review_cron") or "*/5 * * * *"
+
+    @property
+    def daily_report_cron(self) -> Optional[str]:
+        value = self.config.get("daily_report_cron")
+        if value is None:
+            return "0 23 * * *"
+        value = str(value).strip()
+        return value or None
 
     @property
     def config_sync_interval(self) -> int:
@@ -658,12 +688,21 @@ class SiteRegistry:
             if res.status_code in (301, 302) and "login" in (res.headers.get("Location") or "").lower():
                 result["reason"] = "跳转登录页"
                 return result
+            if res.status_code != 200:
+                result["reason"] = f"HTTP {res.status_code}"
+                return result
             text = res.text or ""
-            if "logout" in text.lower() or (site["local"].get("username") or "").lower() in text.lower():
+            if not _is_normal_homepage_html(text, res.headers.get("Content-Type")):
+                result["reason"] = "返回非首页 HTML 页面"
+                return result
+            lower_text = text.lower()
+            if "login" in lower_text:
+                result["reason"] = "页面包含登录提示"
+                return result
+            username_lower = (site["local"].get("username") or "").lower()
+            if "logout" in lower_text or (username_lower and username_lower in lower_text):
                 result["valid"] = True
                 result["reason"] = ""
-            elif "login" in text.lower():
-                result["reason"] = "页面包含登录提示"
             else:
                 result["valid"] = True
         except Exception as exc:
@@ -716,13 +755,6 @@ class SiteRegistry:
                     status.get("valid"),
                     status.get("reason"),
                 )
-                if (
-                    prev
-                    and prev.get("valid")
-                    and not status.get("valid")
-                    and self.config_mgr.config.get("notify_cookie_invalid", True)
-                ):
-                    self._notify_cookie_invalid(status)
         valid_cnt = len([r for r in reports if r.get("valid")])
         invalid_cnt = len([r for r in reports if r.get("matched") and not r.get("valid")])
         unmatched_cnt = len([r for r in reports if not r.get("matched")])
@@ -734,22 +766,6 @@ class SiteRegistry:
             len(reports),
         )
         return reports
-
-    def _notify_cookie_invalid(self, status: Dict[str, Any]):
-        title = f"Cookie 失效：{status.get('site_name', status.get('site_key'))}"
-        text = (
-            f"站点 {status.get('site_name')} Cookie 已失效。\n"
-            f"原因：{status.get('reason') or '未知'}\n"
-            f"时间：{status.get('checked_at')}"
-        )
-        try:
-            self.plugin.post_message(
-                mtype=NotificationType.SiteMessage,
-                title=title,
-                text=text,
-            )
-        except Exception as exc:
-            logger.error("发送 Cookie 失效通知失败: %s", exc)
 
     def retry_failed_cookies(self) -> List[Dict[str, Any]]:
         """
@@ -1329,7 +1345,44 @@ class ReviewEngine:
             "skipped_no_cookie": 0,
         }
         self.skip_history = plugin.get_data("skip_history") or {}
+        self._ensure_daily_stats_initialized()
         self._cleanup_skip_history()
+
+    def _ensure_daily_stats_initialized(self):
+        stats = self._get_daily_stats()
+        self.plugin.save_data("daily_review_stats", stats)
+
+    def _get_daily_stats(self) -> Dict[str, Any]:
+        today = datetime.now().strftime("%Y-%m-%d")
+        stored = self.plugin.get_data("daily_review_stats") or {}
+        if stored.get("date") != today:
+            stored = {
+                "date": today,
+                "approve": 0,
+                "reject": 0,
+                "failed": 0,
+                "skipped_no_cookie": 0,
+            }
+        return stored
+
+    def _increment_stat(self, key: str):
+        if key not in ("approve", "reject", "failed", "skipped_no_cookie"):
+            return
+        self.stats[key] = int(self.stats.get(key, 0) or 0) + 1
+        daily = self._get_daily_stats()
+        daily[key] = int(daily.get(key, 0) or 0) + 1
+        self.plugin.save_data("daily_review_stats", daily)
+        self.plugin.save_data("review_health_stats", self.stats)
+
+    def get_today_review_stats(self) -> Dict[str, int]:
+        stats = self._get_daily_stats()
+        self.plugin.save_data("daily_review_stats", stats)
+        return {
+            "approve": int(stats.get("approve", 0) or 0),
+            "reject": int(stats.get("reject", 0) or 0),
+            "failed": int(stats.get("failed", 0) or 0),
+            "skipped_no_cookie": int(stats.get("skipped_no_cookie", 0) or 0),
+        }
 
     def _parse_ts(self, ts: Optional[str]) -> Optional[datetime]:
         if not ts:
@@ -1545,16 +1598,32 @@ class ReviewEngine:
         if self._should_bypass_application(app_id):
             return
         skipped_sites = []
+        invalid_cookie_sites: List[str] = []
+        parse_unready_sites: List[str] = []
         site_results = []
+        parse_results = self.plugin.get_data("parse_check_results") or []
+        parse_map = {item.get("site_key"): item for item in parse_results if item.get("site_key")}
+        cookie_states = self.registry.cookie_status or {}
 
         # 缺少 Cookie 直接跳过
         for account in site_accounts:
             match = self.registry.match_site_account(account)
             if not match or not match.get("has_cookie"):
                 skipped_sites.append(account.get("name") or account.get("site_key"))
+                continue
+            site_key = account.get("site_key") or account.get("key")
+            state = cookie_states.get(site_key) or {}
+            if not (state.get("matched") and state.get("valid")):
+                reason = state.get("reason") or "Cookie 未通过检测"
+                invalid_cookie_sites.append(f"{account.get('name') or site_key}({reason})")
+                continue
+            parse_res = parse_map.get(site_key) or {}
+            parse_status = (parse_res.get("status") or "").lower()
+            if parse_status not in ("success", "partial"):
+                parse_reason = parse_res.get("reason") or "解析未通过"
+                parse_unready_sites.append(f"{account.get('name') or site_key}({parse_reason})")
         if skipped_sites:
-            self.stats["skipped_no_cookie"] += 1
-            self.plugin.save_data("review_health_stats", self.stats)
+            self._increment_stat("skipped_no_cookie")
             self.skip_history[app_id] = {
                 "sites": skipped_sites,
                 "timestamp": datetime.now().isoformat(),
@@ -1562,6 +1631,15 @@ class ReviewEngine:
             self.plugin.save_data("skip_history", self.skip_history)
             logger.warning(
                 "申请 %s 缺少站点匹配或 Cookie，跳过并缓存 48 小时，缺失站点=%s", app_id, ",".join(skipped_sites)
+            )
+            return
+        if invalid_cookie_sites or parse_unready_sites:
+            self._increment_stat("skipped_no_cookie")
+            logger.warning(
+                "申请 %s 跳过：Cookie/解析检测未通过，Cookie=%s，解析=%s",
+                app_id,
+                ",".join(invalid_cookie_sites) if invalid_cookie_sites else "无",
+                ",".join(parse_unready_sites) if parse_unready_sites else "无",
             )
             return
 
@@ -1581,28 +1659,27 @@ class ReviewEngine:
             decision = self._decide(application, site_results)
             if decision["action"] == "unlock":
                 self.unlock_application(app_id, decision["remark"])
-                self.stats["failed"] += 1
+                self._increment_stat("failed")
                 self._notify_exception(application, decision["remark"])
             else:
                 ok = self.update_status(app_id, decision["action"], decision["remark"])
                 if ok:
                     if decision["action"] == "approve":
-                        self.stats["approve"] += 1
+                        self._increment_stat("approve")
                     elif decision["action"] == "reject":
-                        self.stats["reject"] += 1
+                        self._increment_stat("reject")
                     logger.info("申请 %s 状态提交成功：%s", app_id, decision["action"])
                     if self.config_mgr.config.get("notify_review_result", True):
                         self._notify_review_result(application, decision, site_results)
                 else:
                     self.unlock_application(app_id, "审核结果已生成但状态更新失败，请人工处理。")
-                    self.stats["failed"] += 1
+                    self._increment_stat("failed")
                     self._notify_exception(application, "调用 /status 失败，已自动解锁")
             self.plugin.save_data("review_health_stats", self.stats)
         except Exception as exc:
             logger.error("处理申请 %s 时异常：%s", app_id, exc)
             self.unlock_application(app_id, f"自动审核失败: {exc}")
-            self.stats["failed"] += 1
-            self.plugin.save_data("review_health_stats", self.stats)
+            self._increment_stat("failed")
             self._notify_exception(application, f"自动审核异常：{exc}")
         finally:
             logger.info("申请 %s 处理结束", app_id)
@@ -2092,7 +2169,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.0.9"
+    plugin_version = "3.1.0"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
@@ -2205,6 +2282,19 @@ class LuckPTAutoReview(_PluginBase):
             name="心跳检测",
         )
         logger.info("已注册心跳任务，间隔=1分钟")
+        # 每日统计报表
+        if self.config_mgr.daily_report_cron:
+            try:
+                report_cron = CronTrigger.from_crontab(self.config_mgr.daily_report_cron)
+                self.scheduler.add_job(
+                    self._send_daily_report,
+                    report_cron,
+                    id="luckpt_daily_report",
+                    name="每日统计报表",
+                )
+                logger.info("已注册每日统计报表任务，cron=%s", self.config_mgr.daily_report_cron)
+            except Exception as exc:
+                logger.error("添加每日统计报表 Cron 失败：%s", exc)
         # 一次性任务
         if self.config_mgr.config.get("run_cookie_check_once"):
             self.scheduler.add_job(
@@ -2267,6 +2357,13 @@ class LuckPTAutoReview(_PluginBase):
 
     def _parse_check_one(self, key: str, site: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """单站点解析检测，供全量检测与失败重试复用。"""
+        if not self.registry:
+            logger.debug("解析检测跳过：站点=%s Registry 未初始化", key)
+            return None
+        cookie_state = (self.registry.cookie_status or {}).get(key) or {}
+        if not (cookie_state.get("matched") and cookie_state.get("valid")):
+            logger.debug("解析检测跳过：站点=%s Cookie 未通过检测", key)
+            return None
         if not site.get("local") or not site.get("local", {}).get("cookie"):
             logger.debug("解析检测跳过：站点=%s 缺少本地配置或 Cookie", key)
             return None
@@ -2400,7 +2497,13 @@ class LuckPTAutoReview(_PluginBase):
         self.registry.refresh()
         existing = self.get_data("parse_check_results") or []
         mapping = {r.get("site_key"): r for r in existing if r.get("site_key")}
-        targets = [k for k, v in mapping.items() if v.get("status") == "failed"]
+        cookie_states = self.registry.cookie_status or {}
+
+        def _cookie_ok(site_key: str) -> bool:
+            state = cookie_states.get(site_key) or {}
+            return bool(state.get("matched") and state.get("valid"))
+
+        targets = [k for k, v in mapping.items() if v.get("status") == "failed" and _cookie_ok(k)]
         if not targets:
             return []
         logger.info("开始解析失败重试，站点数=%s", len(targets))
@@ -2450,11 +2553,16 @@ class LuckPTAutoReview(_PluginBase):
             return
         self.registry.refresh()
         results: List[Dict[str, Any]] = []
-        logger.info("开始解析检测，站点数=%s", len(self.registry.site_mapping))
-
+        cookie_states = self.registry.cookie_status or {}
+        eligible_sites = {
+            key: site
+            for key, site in self.registry.site_mapping.items()
+            if (cookie_states.get(key) or {}).get("matched") and (cookie_states.get(key) or {}).get("valid")
+        }
+        logger.info("开始解析检测，站点数=%s，Cookie 通过=%s", len(self.registry.site_mapping), len(eligible_sites))
         with ThreadPoolExecutor(max_workers=8) as executor:
             future_to_key = {
-                executor.submit(self._parse_check_one, key, site): key for key, site in self.registry.site_mapping.items()
+                executor.submit(self._parse_check_one, key, site): key for key, site in eligible_sites.items()
             }
             for future in as_completed(future_to_key):
                 try:
@@ -2472,9 +2580,125 @@ class LuckPTAutoReview(_PluginBase):
                 if res:
                     results.append(res)
         self.save_data("parse_check_results", results)
-        success_cnt = len([r for r in results if r.get("status") == "success"])
-        fail_cnt = len([r for r in results if r.get("status") != "success"])
+        success_cnt = len([r for r in results if r.get("status") in ("success", "partial")])
+        fail_cnt = len([r for r in results if r.get("status") == "failed"])
         logger.info("解析检测结束：成功=%s 失败=%s 总计=%s", success_cnt, fail_cnt, len(results))
+
+    @staticmethod
+    def _parse_time_str(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_time(value: Optional[datetime]) -> str:
+        if not value:
+            return "-"
+        return value.isoformat(timespec="seconds")
+
+    def _summarize_cookie_status(self) -> Tuple[Dict[str, int], str]:
+        cookie_status = self.get_data("cookie_status") or {}
+        remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
+        all_keys = {k for k in cookie_status.keys()}
+        all_keys |= {s.get("key") or s.get("site_key") for s in remote_sites if s}
+        all_keys.discard(None)
+        all_keys.discard("")
+        summary = {"valid": 0, "invalid": 0, "unmatched": 0, "unchecked": 0}
+        latest_at: Optional[datetime] = None
+        for key in all_keys:
+            status = cookie_status.get(key) or {}
+            matched = status.get("matched")
+            valid = status.get("valid")
+            checked_at = self._parse_time_str(status.get("checked_at"))
+            if checked_at and (latest_at is None or checked_at > latest_at):
+                latest_at = checked_at
+            if status and matched is False:
+                summary["unmatched"] += 1
+            elif status and valid is True:
+                summary["valid"] += 1
+            elif status and valid is False:
+                summary["invalid"] += 1
+            else:
+                summary["unchecked"] += 1
+        return summary, self._format_time(latest_at)
+
+    def _summarize_parse_results(self) -> Tuple[Dict[str, int], str]:
+        parse_results = self.get_data("parse_check_results") or []
+        remote_sites = self.config_mgr.remote_sites if self.config_mgr else []
+        all_keys = {item.get("site_key") for item in parse_results if item.get("site_key")}
+        all_keys |= {s.get("key") or s.get("site_key") for s in remote_sites if s}
+        all_keys.discard(None)
+        all_keys.discard("")
+        summary = {"success": 0, "partial": 0, "failed": 0, "unchecked": 0}
+        latest_at: Optional[datetime] = None
+        mapping = {item.get("site_key"): item for item in parse_results if item.get("site_key")}
+        for key in all_keys:
+            res = mapping.get(key) or {}
+            status = (res.get("status") or "").lower()
+            checked_at = self._parse_time_str(res.get("checked_at"))
+            if checked_at and (latest_at is None or checked_at > latest_at):
+                latest_at = checked_at
+            if status == "success":
+                summary["success"] += 1
+            elif status == "partial":
+                summary["partial"] += 1
+            elif status == "failed":
+                summary["failed"] += 1
+            else:
+                summary["unchecked"] += 1
+        return summary, self._format_time(latest_at)
+
+    def _send_daily_report(self):
+        if not self.config_mgr or not self.config_mgr.enabled:
+            logger.debug("每日统计报表跳过：插件未启用")
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        review_stats = {
+            "approve": 0,
+            "reject": 0,
+            "failed": 0,
+            "skipped_no_cookie": 0,
+        }
+        if self.review_engine:
+            review_stats = self.review_engine.get_today_review_stats()
+        cookie_summary, cookie_time = self._summarize_cookie_status()
+        parse_summary, parse_time = self._summarize_parse_results()
+
+        lines = [
+            f"日期：{today}",
+            "",
+            "今日审核：",
+            f"- 通过：{review_stats.get('approve', 0)}",
+            f"- 拒绝：{review_stats.get('reject', 0)}",
+            f"- 跳过：{review_stats.get('skipped_no_cookie', 0)}",
+            f"- 异常：{review_stats.get('failed', 0)}",
+            "",
+            "Cookie 检测（最新一次）：",
+            f"- 正常：{cookie_summary.get('valid', 0)}",
+            f"- 失效：{cookie_summary.get('invalid', 0)}",
+            f"- 未匹配：{cookie_summary.get('unmatched', 0)}",
+            f"- 未检测：{cookie_summary.get('unchecked', 0)}",
+            f"- 最后检测时间：{cookie_time}",
+            "",
+            "解析检测（最新一次）：",
+            f"- 成功：{parse_summary.get('success', 0)}",
+            f"- 存疑：{parse_summary.get('partial', 0)}",
+            f"- 失败：{parse_summary.get('failed', 0)}",
+            f"- 未检测：{parse_summary.get('unchecked', 0)}",
+            f"- 最后检测时间：{parse_time}",
+        ]
+        try:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=f"LuckPT 每日统计报表 {today}",
+                text="\n".join(lines),
+            )
+            logger.info("每日统计报表已推送：%s", today)
+        except Exception as exc:
+            logger.error("每日统计报表推送失败: %s", exc)
 
     # -------------- UI：配置 --------------
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -2685,6 +2909,51 @@ class LuckPTAutoReview(_PluginBase):
                         "component": "VCard",
                         "props": {"class": "mb-4", "variant": "tonal"},
                         "content": [
+                            {"component": "VCardTitle", "text": "每日统计报表"},
+                            {
+                                "component": "VCardText",
+                                "content": [
+                                    {
+                                        "component": "VRow",
+                                        "content": [
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VCronField",
+                                                        "props": {
+                                                            "model": "daily_report_cron",
+                                                            "label": "报表推送时间 (Cron)",
+                                                            "placeholder": "0 23 * * *",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                            {
+                                                "component": "VCol",
+                                                "props": {"cols": 12, "md": 6},
+                                                "content": [
+                                                    {
+                                                        "component": "VAlert",
+                                                        "props": {
+                                                            "type": "info",
+                                                            "variant": "tonal",
+                                                            "text": "留空可禁用，默认每天 23:00 推送当日统计。",
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VCard",
+                        "props": {"class": "mb-4", "variant": "tonal"},
+                        "content": [
                             {"component": "VCardTitle", "text": "通知设置"},
                             {
                                 "component": "VCardText",
@@ -2723,19 +2992,6 @@ class LuckPTAutoReview(_PluginBase):
                                                         "component": "VSwitch",
                                                         "props": {"model": "notify_pending", "label": "待审核提醒"},
                                                     }
-                                                ],
-                                            },
-                                            {
-                                                "component": "VCol",
-                                                "props": {"cols": 12, "md": 3},
-                                                "content": [
-                                                    {
-                                                        "component": "VSwitch",
-                                                        "props": {
-                                                            "model": "notify_cookie_invalid",
-                                                            "label": "Cookie 失效通知",
-                                                        },
-                                                    },
                                                 ],
                                             },
                                         ],
@@ -2800,7 +3056,10 @@ class LuckPTAutoReview(_PluginBase):
                 ],
             }
         ]
-        return form, self.config_mgr.config
+        config_data = dict(self.config_mgr.config)
+        # 使用属性以应用默认值；空串用于关闭定时任务
+        config_data["daily_report_cron"] = self.config_mgr.daily_report_cron or ""
+        return form, config_data
 
     # -------------- UI：展示页 --------------
     def get_page(self) -> List[dict]:
