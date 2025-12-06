@@ -386,6 +386,41 @@ def _is_normal_homepage_html(html: str, content_type: str = "") -> bool:
     return text_len > 30
 
 
+def _looks_like_login_page(html: str) -> bool:
+    """检测页面是否包含典型登录表单，减少因关键词误判登录状态的可能。"""
+    if not html:
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    if not soup:
+        return False
+
+    for form in soup.find_all("form"):
+        inputs = form.find_all("input")
+        has_password = any((inp.get("type") or "").lower() == "password" for inp in inputs)
+        if not has_password:
+            continue
+        action = (form.get("action") or "").lower()
+        names = " ".join([(inp.get("name") or "") for inp in inputs]).lower()
+        classes = " ".join(form.get("class") or []).lower()
+        if any(kw in action for kw in ("login", "signin", "sign-in", "takelogin")):
+            return True
+        if any(kw in names for kw in ("login", "username", "password")):
+            return True
+        if any(kw in classes for kw in ("login", "signin")):
+            return True
+
+    text_lower = soup.get_text(" ", strip=True).lower()
+    return "login" in text_lower and "password" in text_lower
+
+
+def _has_auth_markers(text_lower: str, username_lower: str = "") -> bool:
+    """检测页面上是否存在登录态标识（用户名/退出链接等）。"""
+    logout_keywords = ("logout", "log out", "sign out", "退出", "退出登录", "登出", "注销")
+    if username_lower and username_lower in text_lower:
+        return True
+    return any(kw in text_lower for kw in logout_keywords)
+
+
 # ----------------------------
 # 配置管理
 # ----------------------------
@@ -695,12 +730,14 @@ class SiteRegistry:
             if not _is_normal_homepage_html(text, res.headers.get("Content-Type")):
                 result["reason"] = "返回非首页 HTML 页面"
                 return result
-            lower_text = text.lower()
-            if "login" in lower_text:
-                result["reason"] = "页面包含登录提示"
-                return result
             username_lower = (site["local"].get("username") or "").lower()
-            if "logout" in lower_text or (username_lower and username_lower in lower_text):
+            lower_text = text.lower()
+            has_auth_marker = _has_auth_markers(lower_text, username_lower)
+            looks_like_login = _looks_like_login_page(text)
+            if looks_like_login and not has_auth_marker:
+                result["reason"] = "页面疑似登录页（检测到登录表单）"
+                return result
+            if has_auth_marker:
                 result["valid"] = True
                 result["reason"] = ""
             else:
@@ -2169,7 +2206,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
