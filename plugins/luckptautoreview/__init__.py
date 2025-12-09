@@ -1450,8 +1450,12 @@ class ReviewEngine:
             "skipped_no_cookie": 0,
         }
         self.skip_history = plugin.get_data("skip_history") or {}
+        self.lock_tracker = plugin.get_data("lock_tracker") or {}
+        self.lock_blacklist = plugin.get_data("lock_blacklist") or {}
         self._ensure_daily_stats_initialized()
         self._cleanup_skip_history()
+        self._cleanup_lock_blacklist()
+        self._cleanup_lock_tracker()
 
     def _ensure_daily_stats_initialized(self):
         stats = self._get_daily_stats()
@@ -1531,6 +1535,82 @@ class ReviewEngine:
         self.plugin.save_data("skip_history", self.skip_history)
         return False
 
+    # --- 锁定管理 ---
+    def _cleanup_lock_tracker(self):
+        """移除超过 48 小时的陈旧锁记录，避免无限重试。"""
+        now = datetime.now()
+        changed = False
+        for app_id, info in list(self.lock_tracker.items()):
+            ts = self._parse_ts((info or {}).get("first_locked_at"))
+            if ts and now - ts >= timedelta(hours=self.SKIP_CACHE_HOURS):
+                self.lock_tracker.pop(app_id, None)
+                changed = True
+        if changed:
+            self.plugin.save_data("lock_tracker", self.lock_tracker)
+
+    def _cleanup_lock_blacklist(self):
+        now = datetime.now()
+        changed = False
+        for app_id, info in list(self.lock_blacklist.items()):
+            ts = self._parse_ts((info or {}).get("timestamp"))
+            if not ts or now - ts >= timedelta(hours=self.SKIP_CACHE_HOURS):
+                self.lock_blacklist.pop(app_id, None)
+                changed = True
+        if changed:
+            self.plugin.save_data("lock_blacklist", self.lock_blacklist)
+
+    def _is_lock_blacklisted(self, app_id: Any) -> bool:
+        entry = self.lock_blacklist.get(app_id)
+        if not entry:
+            return False
+        ts = self._parse_ts(entry.get("timestamp"))
+        if not ts:
+            self.lock_blacklist.pop(app_id, None)
+            self.plugin.save_data("lock_blacklist", self.lock_blacklist)
+            return False
+        if datetime.now(ts.tzinfo) - ts < timedelta(hours=self.SKIP_CACHE_HOURS):
+            logger.warning("申请 %s 因重复锁定失败已加入黑名单，48 小时内不再处理", app_id)
+            return True
+        self.lock_blacklist.pop(app_id, None)
+        self.plugin.save_data("lock_blacklist", self.lock_blacklist)
+        return False
+
+    def _record_lock(self, app_id: Any):
+        info = self.lock_tracker.get(app_id) or {}
+        info.setdefault("first_locked_at", datetime.now().isoformat())
+        info["attempts"] = int(info.get("attempts") or 0)
+        info["last_attempt_at"] = datetime.now().isoformat()
+        self.lock_tracker[app_id] = info
+        self.plugin.save_data("lock_tracker", self.lock_tracker)
+
+    def _mark_lock_attempt(self, app_id: Any):
+        info = self.lock_tracker.get(app_id) or {"first_locked_at": datetime.now().isoformat()}
+        info["attempts"] = int(info.get("attempts") or 0) + 1
+        info["last_attempt_at"] = datetime.now().isoformat()
+        self.lock_tracker[app_id] = info
+        self.plugin.save_data("lock_tracker", self.lock_tracker)
+
+    def _clear_lock_record(self, app_id: Any):
+        if app_id in self.lock_tracker:
+            self.lock_tracker.pop(app_id, None)
+            self.plugin.save_data("lock_tracker", self.lock_tracker)
+
+    def _force_unlock_and_blacklist(self, app_id: Any, remark: str):
+        logger.warning("申请 %s 连续尝试仍被锁定，将强制解锁并加入黑名单", app_id)
+        self.unlock_application(app_id, remark)
+        self.lock_blacklist[app_id] = {"timestamp": datetime.now().isoformat(), "remark": remark}
+        self.plugin.save_data("lock_blacklist", self.lock_blacklist)
+        self._clear_lock_record(app_id)
+
+    def _after_lock_attempt(self, app_id: Any, success: bool):
+        if success:
+            self._clear_lock_record(app_id)
+            return
+        info = self.lock_tracker.get(app_id) or {}
+        attempts = int(info.get("attempts") or 0)
+        if attempts >= 2:
+            self._force_unlock_and_blacklist(app_id, "连续两次续审失败，自动解锁")
+
     # --- 通用请求 ---
     def _api_client(self) -> RequestUtils:
         headers = {"Authorization": f"Bearer {self.config_mgr.api_token}", "Content-Type": "application/json"}
@@ -1575,24 +1655,31 @@ class ReviewEngine:
         except Exception as exc:
             logger.error("同步审核配置异常: %s", exc)
 
-    def fetch_pending(self) -> List[Dict[str, Any]]:
-        logger.debug("开始获取待审核列表(auto_status=none)")
-        query = {"auto_status": "none", "page": 1, "per_page": 50}
-        res = self._api_client().get_res(self._full_url("/api/v1/site-verifications"), params=query)
-        if not res or res.status_code != 200:
-            logger.error("获取待审核列表失败，HTTP 状态码：%s", res.status_code if res else "无响应")
-            return []
-        try:
-            payload = res.json()
-        except Exception as exc:
-            logger.error("解析待审核列表失败: %s", exc)
-            return []
-        if str(payload.get("ret")) != "0":
-            logger.error("获取待审核列表返回错误：%s", payload.get("msg"))
-            return []
-        data_list = payload.get("data", {}).get("data") or []
-        logger.info("获取待审核列表成功，数量=%s", len(data_list))
-        return data_list
+    def fetch_pending(self, statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        targets = statuses or ["none"]
+        collected: Dict[Any, Dict[str, Any]] = {}
+        for status in targets:
+            logger.debug("开始获取待审核列表(auto_status=%s)", status)
+            query = {"auto_status": status, "page": 1, "per_page": 50}
+            res = self._api_client().get_res(self._full_url("/api/v1/site-verifications"), params=query)
+            if not res or res.status_code != 200:
+                logger.error("获取待审核列表失败，HTTP 状态码：%s", res.status_code if res else "无响应")
+                continue
+            try:
+                payload = res.json()
+            except Exception as exc:
+                logger.error("解析待审核列表失败: %s", exc)
+                continue
+            if str(payload.get("ret")) != "0":
+                logger.error("获取待审核列表返回错误：%s", payload.get("msg"))
+                continue
+            data_list = payload.get("data", {}).get("data") or []
+            for item in data_list:
+                app_id = item.get("id")
+                if app_id is not None:
+                    collected[app_id] = item
+        logger.info("获取待审核列表成功，数量=%s", len(collected))
+        return list(collected.values())
 
     def fetch_logs(self):
         logger.debug("开始获取审核日志")
@@ -1634,14 +1721,16 @@ class ReviewEngine:
             res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/unlock"), json=body)
             if not res:
                 logger.error("申请 %s 解锁失败：无响应", app_id)
-                return
+                return False
             payload = res.json()
             if str(payload.get("ret")) != "0":
                 logger.error("解锁申请 %s 失败：%s", app_id, payload.get("msg"))
-            else:
-                logger.info("申请 %s 解锁成功", app_id)
+                return False
+            logger.info("申请 %s 解锁成功", app_id)
+            return True
         except Exception as exc:
             logger.error("解锁申请 %s 时异常: %s", app_id, exc)
+            return False
 
     def update_status(self, app_id: Any, action: str, remark: str) -> bool:
         payload = {"action": action, "remark": self._trim_remark(remark)}
@@ -1687,21 +1776,36 @@ class ReviewEngine:
             logger.info("自动审核任务开始")
             self.sync_remote_config()
             self.registry.refresh()
-            apps = self.fetch_pending()
+            apps = self.fetch_pending(statuses=["processing", "none"])
+            # 将已知自身锁定的请求提前处理
+            apps = sorted(apps, key=lambda a: 0 if a.get("id") in self.lock_tracker else 1)
             for app in apps:
-                self._process_application(app)
+                app_id = app.get("id")
+                if self._is_lock_blacklisted(app_id):
+                    continue
+                resume_locked = app_id in self.lock_tracker
+                if (app.get("auto_status") or "").lower() == "processing" and not resume_locked:
+                    # 他人锁定的请求，跳过
+                    continue
+                success = self._process_application(app, resume_locked=resume_locked)
+                self._after_lock_attempt(app_id, success)
             self.fetch_logs()
         finally:
             logger.info("自动审核任务结束")
             self.running = False
 
-    def _process_application(self, application: Dict[str, Any]):
+    def _process_application(self, application: Dict[str, Any], resume_locked: bool = False) -> bool:
         app_id = application.get("id")
         site_accounts = application.get("site_accounts") or []
         target_email = (application.get("target_email") or "").lower()
         target_username = (application.get("target_username") or "").lower()
+        if self._is_lock_blacklisted(app_id):
+            return False
         if self._should_bypass_application(app_id):
-            return
+            if resume_locked:
+                self.unlock_application(app_id, "续审跳过，释放锁")
+                self._clear_lock_record(app_id)
+            return False
         skipped_sites = []
         invalid_cookie_sites: List[str] = []
         parse_unready_sites: List[str] = []
@@ -1737,7 +1841,7 @@ class ReviewEngine:
             logger.warning(
                 "申请 %s 缺少站点匹配或 Cookie，跳过并缓存 48 小时，缺失站点=%s", app_id, ",".join(skipped_sites)
             )
-            return
+            return False
         if invalid_cookie_sites or parse_unready_sites:
             self._increment_stat("skipped_no_cookie")
             logger.warning(
@@ -1746,13 +1850,21 @@ class ReviewEngine:
                 ",".join(invalid_cookie_sites) if invalid_cookie_sites else "无",
                 ",".join(parse_unready_sites) if parse_unready_sites else "无",
             )
-            return
+            return False
 
         # 锁定
-        locked = self.lock_application(app_id)
+        locked = True
+        if resume_locked:
+            if app_id not in self.lock_tracker:
+                self._record_lock(app_id)
+        else:
+            locked = self.lock_application(app_id)
+            if locked:
+                self._record_lock(app_id)
         if not locked:
             logger.error("申请 %s 加锁失败，跳过", app_id)
-            return
+            return False
+        self._mark_lock_attempt(app_id)
 
         try:
             for account in site_accounts:
@@ -1763,9 +1875,12 @@ class ReviewEngine:
 
             decision = self._decide(application, site_results)
             if decision["action"] == "unlock":
-                self.unlock_application(app_id, decision["remark"])
+                unlocked = self.unlock_application(app_id, decision["remark"])
+                if unlocked:
+                    self._clear_lock_record(app_id)
                 self._increment_stat("failed")
                 self._notify_exception(application, decision["remark"])
+                return False
             else:
                 ok = self.update_status(app_id, decision["action"], decision["remark"])
                 if ok:
@@ -1776,18 +1891,25 @@ class ReviewEngine:
                     logger.info("申请 %s 状态提交成功：%s", app_id, decision["action"])
                     if self.config_mgr.config.get("notify_review_result", True):
                         self._notify_review_result(application, decision, site_results)
+                    self._clear_lock_record(app_id)
+                    return True
                 else:
-                    self.unlock_application(app_id, "审核结果已生成但状态更新失败，请人工处理。")
+                    unlocked = self.unlock_application(app_id, "审核结果已生成但状态更新失败，请人工处理。")
+                    if unlocked:
+                        self._clear_lock_record(app_id)
                     self._increment_stat("failed")
                     self._notify_exception(application, "调用 /status 失败，已自动解锁")
-            self.plugin.save_data("review_health_stats", self.stats)
+                    return False
         except Exception as exc:
             logger.error("处理申请 %s 时异常：%s", app_id, exc)
-            self.unlock_application(app_id, f"自动审核失败: {exc}")
+            unlocked = self.unlock_application(app_id, f"自动审核失败: {exc}")
+            if unlocked:
+                self._clear_lock_record(app_id)
             self._increment_stat("failed")
             self._notify_exception(application, f"自动审核异常：{exc}")
         finally:
             logger.info("申请 %s 处理结束", app_id)
+        return False
 
     def report_client_status(self):
         """定期向审核系统汇报本地站点状态。"""
