@@ -421,6 +421,74 @@ def _has_auth_markers(text_lower: str, username_lower: str = "") -> bool:
     return any(kw in text_lower for kw in logout_keywords)
 
 
+def _decode_html_response(res) -> str:
+    """优先使用智能编码探测解码 HTML，避免编码异常导致的关键词漏检。"""
+    if not res:
+        return ""
+    try:
+        return RequestUtils.get_decoded_html_content(res, performance_mode=True)
+    except Exception:
+        try:
+            return res.text or ""
+        except Exception:
+            return ""
+
+
+def _detect_auth_state(html: str, username_lower: str = "", final_url: str = "") -> str:
+    """
+    基于 HTML 内容与最终 URL 估算当前登录态。
+    返回值：logged_in / login / unknown
+    """
+    if not html:
+        return "unknown"
+
+    final_url_l = (final_url or "").lower()
+    if any(key in final_url_l for key in ("login", "signin", "sign-in", "takelogin")):
+        return "login"
+
+    soup = BeautifulSoup(html, "html.parser")
+    text_lower = ""
+    try:
+        text_lower = soup.get_text(" ", strip=True).lower() if soup else ""
+    except Exception:
+        text_lower = ""
+    html_lower = html.lower()
+    combined = " ".join(filter(None, [html_lower, text_lower]))
+
+    if _has_auth_markers(combined, username_lower):
+        return "logged_in"
+
+    logged_in_markers = (
+        "欢迎回来",
+        "欢迎回家",
+        "当前时间",
+        "魔力值",
+        "银元",
+        "邀请",
+        "收藏",
+        "控制面板",
+        "做种",
+        "上传量",
+        "下载量",
+        "messages.php",
+        "usercp.php",
+        "logout.php",
+        "mybonus.php",
+        "torrents.php",
+    )
+    if any(marker.lower() in combined for marker in logged_in_markers):
+        return "logged_in"
+
+    if _looks_like_login_page(html):
+        return "login"
+
+    login_markers = ("please login", "please log in", "登陆", "登录", "登錄", "signin", "sign in", "密码", "密碼")
+    if any(marker in combined for marker in login_markers):
+        return "login"
+
+    return "unknown"
+
+
 # ----------------------------
 # 配置管理
 # ----------------------------
@@ -720,28 +788,28 @@ class SiteRegistry:
             if not res:
                 result["reason"] = "无响应"
                 return result
+            final_url = getattr(res, "url", "") or base_url
             if res.status_code in (301, 302) and "login" in (res.headers.get("Location") or "").lower():
                 result["reason"] = "跳转登录页"
                 return result
             if res.status_code != 200:
                 result["reason"] = f"HTTP {res.status_code}"
                 return result
-            text = res.text or ""
-            if not _is_normal_homepage_html(text, res.headers.get("Content-Type")):
-                result["reason"] = "返回非首页 HTML 页面"
+            html_text = _decode_html_response(res)
+            if not html_text:
+                result["reason"] = "返回空页面"
                 return result
             username_lower = (site["local"].get("username") or "").lower()
-            lower_text = text.lower()
-            has_auth_marker = _has_auth_markers(lower_text, username_lower)
-            looks_like_login = _looks_like_login_page(text)
-            if looks_like_login and not has_auth_marker:
-                result["reason"] = "页面疑似登录页（检测到登录表单）"
+            auth_state = _detect_auth_state(html_text, username_lower, final_url)
+            if auth_state == "login":
+                result["reason"] = "页面疑似登录页（检测到登录跳转或登录表单）"
                 return result
-            if has_auth_marker:
-                result["valid"] = True
-                result["reason"] = ""
-            else:
-                result["valid"] = True
+            is_normal_html = _is_normal_homepage_html(html_text, res.headers.get("Content-Type"))
+            if not is_normal_html and auth_state != "logged_in":
+                result["reason"] = "返回非首页 HTML 页面"
+                return result
+            result["valid"] = True
+            result["reason"] = ""
         except Exception as exc:
             result["reason"] = f"检测异常: {exc}"
             logger.error("检测站点 %s Cookie 失败: %s", site_key, exc)
@@ -2206,7 +2274,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.1.1"
+    plugin_version = "3.1.2"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
