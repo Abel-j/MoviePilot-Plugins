@@ -1616,6 +1616,29 @@ class ReviewEngine:
         headers = {"Authorization": f"Bearer {self.config_mgr.api_token}", "Content-Type": "application/json"}
         return RequestUtils(headers=headers, timeout=30, proxies=self.config_mgr.api_proxies)
 
+    def _api_try(self, method: str, path: str, retries: int = 3, interval: int = 15, **kwargs):
+        """
+        统一的 API 调用重试封装。默认重试 3 次，间隔 15 秒。
+        返回最后一次响应。
+        """
+        res = None
+        url = self._full_url(path)
+        client = self._api_client()
+        for idx in range(retries):
+            try:
+                if method == "get":
+                    res = client.get_res(url, **kwargs)
+                else:
+                    res = client.post_res(url, **kwargs)
+            except Exception as exc:
+                logger.error("API 请求异常 %s %s: %s", method.upper(), url, exc)
+                res = None
+            if res and res.status_code == 200:
+                return res
+            if idx < retries - 1:
+                time.sleep(interval)
+        return res
+
     def _full_url(self, path: str) -> str:
         return f"{self.config_mgr.api_base.rstrip('/')}{path}"
 
@@ -1642,7 +1665,7 @@ class ReviewEngine:
             logger.debug("配置同步跳过：未到同步间隔")
             return
         try:
-            res = self._api_client().get_res(self._full_url("/api/v1/site-verifications/config"))
+            res = self._api_try("get", "/api/v1/site-verifications/config")
             if res and res.status_code == 200:
                 data = res.json() or {}
                 if str(data.get("ret")) == "0":
@@ -1661,7 +1684,7 @@ class ReviewEngine:
         for status in targets:
             logger.debug("开始获取待审核列表(auto_status=%s)", status)
             query = {"auto_status": status, "page": 1, "per_page": 50}
-            res = self._api_client().get_res(self._full_url("/api/v1/site-verifications"), params=query)
+            res = self._api_try("get", "/api/v1/site-verifications", params=query)
             if not res or res.status_code != 200:
                 logger.error("获取待审核列表失败，HTTP 状态码：%s", res.status_code if res else "无响应")
                 continue
@@ -1686,7 +1709,7 @@ class ReviewEngine:
         if not self.config_mgr.should_fetch_logs():
             logger.debug("获取审核日志跳过：未到刷新间隔")
             return
-        res = self._api_client().get_res(self._full_url("/api/v1/site-verifications/logs"))
+        res = self._api_try("get", "/api/v1/site-verifications/logs")
         if not res or res.status_code != 200:
             logger.error("获取审核日志失败：HTTP %s", res.status_code if res else "无响应")
             return
@@ -1700,7 +1723,7 @@ class ReviewEngine:
             logger.error("解析审核日志失败: %s", exc)
 
     def lock_application(self, app_id: Any) -> bool:
-        res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/lock"))
+        res = self._api_try("post", f"/api/v1/site-verifications/{app_id}/lock", retries=3)
         if not res or res.status_code != 200:
             logger.error("申请 %s 加锁 HTTP 失败：%s", app_id, res.status_code if res else "无响应")
             return False
@@ -1717,27 +1740,31 @@ class ReviewEngine:
 
     def unlock_application(self, app_id: Any, remark: str):
         body = {"remark": self._trim_remark(remark)}
-        try:
-            res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/unlock"), json=body)
-            if not res:
-                logger.error("申请 %s 解锁失败：无响应", app_id)
-                return False
-            payload = res.json()
-            if str(payload.get("ret")) != "0":
-                logger.error("解锁申请 %s 失败：%s", app_id, payload.get("msg"))
-                return False
-            logger.info("申请 %s 解锁成功", app_id)
-            return True
-        except Exception as exc:
-            logger.error("解锁申请 %s 时异常: %s", app_id, exc)
-            return False
+        for idx in range(5):
+            try:
+                res = self._api_try("post", f"/api/v1/site-verifications/{app_id}/unlock", retries=1, json=body)
+                if not res:
+                    logger.error("申请 %s 解锁失败：无响应", app_id)
+                elif res.status_code != 200:
+                    logger.error("申请 %s 解锁失败：HTTP %s", app_id, res.status_code)
+                else:
+                    payload = res.json()
+                    if str(payload.get("ret")) == "0":
+                        logger.info("申请 %s 解锁成功", app_id)
+                        return True
+                    logger.error("解锁申请 %s 失败：%s", app_id, payload.get("msg"))
+            except Exception as exc:
+                logger.error("解锁申请 %s 时异常: %s", app_id, exc)
+            if idx < 4:
+                time.sleep(15)
+        return False
 
     def update_status(self, app_id: Any, action: str, remark: str) -> bool:
         payload = {"action": action, "remark": self._trim_remark(remark)}
-        retries = self.config_mgr.status_retry_count
-        interval = self.config_mgr.status_retry_interval
+        retries = 5
+        interval = 15
         for idx in range(retries):
-            res = self._api_client().post_res(self._full_url(f"/api/v1/site-verifications/{app_id}/status"), json=payload)
+            res = self._api_try("post", f"/api/v1/site-verifications/{app_id}/status", retries=1, json=payload)
             if not res or res.status_code != 200:
                 logger.error("状态更新失败(HTTP) #%s/%s：%s", idx + 1, retries, res.status_code if res else "无响应")
             else:
@@ -2025,7 +2052,7 @@ class ReviewEngine:
             payload["client_config"] = safe_config
 
         try:
-            res = self._api_client().post_res(self._full_url("/api/v1/site-verifications/client-status"), json=payload)
+            res = self._api_try("post", "/api/v1/site-verifications/client-status", json=payload)
         except Exception as exc:
             self._store_heartbeat({}, error=f"状态汇报请求异常: {exc}")
             logger.error("客户端状态汇报异常：%s", exc)
@@ -2071,7 +2098,7 @@ class ReviewEngine:
         if client_version:
             payload["client_version"] = client_version[:64]
         try:
-            res = self._api_client().post_res(self._full_url("/api/v1/site-verifications/heartbeat"), json=payload)
+            res = self._api_try("post", "/api/v1/site-verifications/heartbeat", json=payload)
         except Exception as exc:
             self._store_heartbeat({}, error=f"心跳请求异常: {exc}")
             logger.error("心跳请求异常：%s", exc)
