@@ -1250,12 +1250,13 @@ class ParserEngine:
                 # 最终回退：先尝试“邮箱 xxx”模式，再扫描第一个邮箱
                 text_all = soup.get_text(" ", strip=True) or ""
                 m_label_email = re.search(r"(邮箱|email)[：: ]+([\w.+'%-]+@[\w.-]+)", text_all, re.IGNORECASE)
+                match = None
                 if m_label_email:
                     email = m_label_email.group(2).strip()
                 if not email:
                     match = re.search(r"[\w.+'%-]+@[\w.-]+", text_all)
-                if match:
-                    email = match.group(0).strip()
+                    if match:
+                        email = match.group(0).strip()
             if not email:
                 if not label_map:
                     label_map = self._extract_label_map(soup)
@@ -2423,7 +2424,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.1.3"
+    plugin_version = "3.1.4"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
