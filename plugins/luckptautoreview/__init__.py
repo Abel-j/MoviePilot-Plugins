@@ -1804,7 +1804,7 @@ class ReviewEngine:
             logger.info("自动审核任务开始")
             self.sync_remote_config()
             self.registry.refresh()
-            apps = self.fetch_pending(statuses=["processing", "none"])
+            apps = self.fetch_pending(statuses=["processing", "none", "failed"])
             # 将已知自身锁定的请求提前处理
             apps = sorted(apps, key=lambda a: 0 if a.get("id") in self.lock_tracker else 1)
             for app in apps:
@@ -2424,7 +2424,7 @@ class LuckPTAutoReview(_PluginBase):
     plugin_name = "LuckPT自动审核"
     plugin_desc = "根据审核系统 API 自动匹配站点并提交审核结果。"
     plugin_icon = "https://raw.githubusercontent.com/Abel-j/MoviePilot-Plugins/main/icons/LuckPT.png"
-    plugin_version = "3.1.4"
+    plugin_version = "3.1.5"
     plugin_author = "LuckPT"
     author_url = "https://pt.luckpt.de/"
     plugin_config_prefix = "luckptautoreview_"
